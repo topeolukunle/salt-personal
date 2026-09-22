@@ -1,0 +1,659 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SALT - Smart Asset Lifecycle Tracker
+  STACK 2 OF 2: Application stack.
+  Deploy dynamodb.yaml FIRST then deploy this file.
+  Contains: Cognito User Pool + App Client + 5 Groups,
+  S3 Photo Bucket, IAM Role, Depreciation Calculator Lambda,
+  API Handler Lambda (17 routes), REST API Gateway,
+  EventBridge annual schedule, AWS Amplify Hosting.
+  DynamoDB table is imported via cross-stack reference.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  TableName:
+    Type: String
+    Default: AssetManagement
+    Description: Must match the TableName used in dynamodb.yaml stack
+
+  CognitoDomainPrefix:
+    Type: String
+    Default: asset-tracker-salt-2026
+    Description: Must be globally unique across all AWS accounts
+
+  PhotoBucketName:
+    Type: String
+    Default: asset-tracker-photos-137696816941
+    Description: Must be globally unique. Account ID suffix recommended.
+
+  GitHubRepo:
+    Type: String
+    Default: https://github.com/mrleom/SALT
+    Description: GitHub repository URL for Amplify Hosting
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch to deploy to Amplify Hosting
+
+  AmplifyToken:
+    Type: String
+    Default: REPLACE_WITH_GITHUB_TOKEN
+    NoEcho: true
+    Description: >
+      GitHub personal access token for Amplify to pull your repository.
+      Create at: GitHub Settings -> Developer settings -> Personal access tokens
+      Required scopes: repo
+
+Resources:
+
+  # ════════════════════════════════════════════════════════════════
+  # SECTION 1 — AMAZON COGNITO
+  # ════════════════════════════════════════════════════════════════
+
+  AssetUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub asset-tracker-pool-${Environment}
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      PasswordPolicy:
+        MinimumLength: 8
+        RequireUppercase: true
+        RequireLowercase: true
+        RequireNumbers: true
+        RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Project,     Value: SALT}
+
+  AssetUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref CognitoDomainPrefix
+      UserPoolId: !Ref AssetUserPool
+
+  AssetUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub asset-tracker-client-${Environment}
+      UserPoolId: !Ref AssetUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      AllowedOAuthFlows: [code, implicit]
+      AllowedOAuthScopes: [email, openid, profile]
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs:
+        - https://localhost
+        - !Sub 'https://main.${AmplifyApp.DefaultDomain}'
+      LogoutURLs:
+        - https://localhost
+        - !Sub 'https://main.${AmplifyApp.DefaultDomain}'
+      SupportedIdentityProviders: [COGNITO]
+    DependsOn: AmplifyBranch
+
+  # 5 Cognito Groups — precedence controls priority when user is in multiple groups
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Administrator
+      UserPoolId: !Ref AssetUserPool
+      Description: Full access to all assets users assignments values and reports
+      Precedence: 1
+
+  AuditorGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Auditor
+      UserPoolId: !Ref AssetUserPool
+      Description: Read-only access to all records and asset history
+      Precedence: 2
+
+  ManagerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Manager
+      UserPoolId: !Ref AssetUserPool
+      Description: View department assets and financial reports
+      Precedence: 3
+
+  TechnicianGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Technician
+      UserPoolId: !Ref AssetUserPool
+      Description: Create assets upload images update condition record maintenance
+      Precedence: 4
+
+  EmployeeGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Employee
+      UserPoolId: !Ref AssetUserPool
+      Description: View own assigned assets and report problems
+      Precedence: 5
+
+  # ════════════════════════════════════════════════════════════════
+  # SECTION 2 — S3 PHOTO BUCKET
+  # ════════════════════════════════════════════════════════════════
+
+  AssetPhotoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref PhotoBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, DELETE, HEAD]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Project,     Value: SALT}
+
+  AssetPhotoBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AssetPhotoBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyPublicAccess
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub '${AssetPhotoBucket.Arn}/*'
+            Condition:
+              StringNotEquals:
+                'aws:PrincipalArn': !GetAtt LambdaExecutionRole.Arn
+
+  # ════════════════════════════════════════════════════════════════
+  # SECTION 3 — IAM ROLE FOR ALL LAMBDA FUNCTIONS
+  # ════════════════════════════════════════════════════════════════
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub SALT-Lambda-Role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource:
+                  # Import table ARN from DynamoDB stack output
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/*'
+
+        - PolicyName: S3PhotoAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub '${AssetPhotoBucket.Arn}/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt AssetPhotoBucket.Arn
+
+        - PolicyName: LambdaInvokeCalculator
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt DepreciationCalculatorFunction.Arn
+
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: 'arn:aws:bedrock:us-east-1::foundation-model/*'
+
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  # ════════════════════════════════════════════════════════════════
+  # SECTION 4 — LAMBDA FUNCTIONS
+  # ════════════════════════════════════════════════════════════════
+
+  # ── Lambda 1: Depreciation Calculator ──────────────────────────
+  DepreciationCalculatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub AssetDepreciationCalculator-${Environment}
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Description: Calculates straight-line depreciation for one or all assets
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Code:
+        ZipFile: |
+          import boto3, json, os
+          from decimal import Decimal
+          from datetime import date
+          dynamodb = boto3.resource('dynamodb')
+          table    = dynamodb.Table(os.environ['TABLE_NAME'])
+
+          def calculate(asset_id):
+              item = table.get_item(
+                  Key={'asset_id': asset_id, 'record_type': 'FINANCIALS'}
+              ).get('Item')
+              if not item:
+                  return {'error': f'No FINANCIALS record for {asset_id}'}
+              pv  = Decimal(str(item.get('purchase_value',   0)))
+              sv  = Decimal(str(item.get('salvage_value',    0)))
+              uly = Decimal(str(item.get('useful_life_years',0)))
+              isd = date.fromisoformat(
+                  item.get('in_service_date', date.today().isoformat()))
+              today = date.today()
+              if uly == 0:
+                  return {'asset_id': asset_id, 'error': 'useful_life_years is zero'}
+              years = Decimal(str((today - isd).days)) / Decimal('365.25')
+              ad  = (pv - sv) / uly
+              acd = min(ad * years, pv - sv)
+              cbv = max(sv, pv - acd)
+              pct = min((years / uly) * Decimal('100'), Decimal('100'))
+              try:
+                  yr = isd.year + int(uly)
+                  er = isd.replace(year=yr).strftime('%Y-%m-%d')
+              except ValueError:
+                  er = f'{isd.year + int(uly)}-{isd.month:02d}-28'
+              table.update_item(
+                  Key={'asset_id': asset_id, 'record_type': 'FINANCIALS'},
+                  UpdateExpression=(
+                      'SET annual_depreciation=:ad,'
+                      ' accumulated_depreciation=:acd,'
+                      ' current_book_value=:cbv,'
+                      ' useful_life_consumed_pct=:pct,'
+                      ' estimated_replacement=:er,'
+                      ' last_calculated_date=:lcd'
+                  ),
+                  ExpressionAttributeValues={
+                      ':ad':  ad.quantize(Decimal('0.01')),
+                      ':acd': acd.quantize(Decimal('0.01')),
+                      ':cbv': cbv.quantize(Decimal('0.01')),
+                      ':pct': pct.quantize(Decimal('0.01')),
+                      ':er':  er,
+                      ':lcd': today.strftime('%Y-%m-%d'),
+                  }
+              )
+              return {
+                  'asset_id':          asset_id,
+                  'annual_depreciation': str(ad.quantize(Decimal('0.01'))),
+                  'current_book_value':  str(cbv.quantize(Decimal('0.01'))),
+                  'life_consumed_pct':   str(pct.quantize(Decimal('0.01'))),
+                  'estimated_replacement': er,
+              }
+
+          def handler(event, context):
+              asset_id = event.get('asset_id')
+              if asset_id:
+                  return {'statusCode': 200, 'body': json.dumps(calculate(asset_id))}
+              resp  = table.scan(
+                  FilterExpression=boto3.dynamodb.conditions.Attr(
+                      'record_type').eq('FINANCIALS'))
+              items = resp['Items']
+              while 'LastEvaluatedKey' in resp:
+                  resp  = table.scan(
+                      FilterExpression=boto3.dynamodb.conditions.Attr(
+                          'record_type').eq('FINANCIALS'),
+                      ExclusiveStartKey=resp['LastEvaluatedKey'])
+                  items.extend(resp['Items'])
+              results = [calculate(i['asset_id']) for i in items]
+              return {'statusCode': 200,
+                      'body': json.dumps({'processed': len(results),
+                                          'results': results})}
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Project,     Value: SALT}
+
+  # ── Lambda 2: API Handler (all 17 routes + RBAC) ───────────────
+  # Full 643-line implementation lives in SAM functions/apihandler/app.py
+  # This inline stub allows CloudFormation to create the function;
+  # update the code afterwards via:
+  #   aws lambda update-function-code \
+  #     --function-name AssetAPIHandler-dev \
+  #     --zip-file fileb://apihandler.zip
+  # Or use the SAM template for full code deployment.
+  APIHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub AssetAPIHandler-${Environment}
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Description: >
+        Handles all 17 REST API routes with Cognito RBAC.
+        Generates maintenance recommendations on every save.
+        Invokes depreciation calculator synchronously after asset write.
+        Full implementation in SAM functions/apihandler/app.py (643 lines).
+      Environment:
+        Variables:
+          TABLE_NAME:          !Ref TableName
+          PHOTO_BUCKET:        !Ref PhotoBucketName
+          CALCULATOR_FUNCTION: !Sub AssetDepreciationCalculator-${Environment}
+      Code:
+        ZipFile: |
+          import json
+          def handler(event, context):
+              if event.get('httpMethod') == 'OPTIONS':
+                  return {'statusCode':200,'headers':{'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type,Authorization','Access-Control-Allow-Methods':'GET,POST,PUT,DELETE,OPTIONS'},'body':''}
+              return {'statusCode':200,'headers':{'Content-Type':'application/json','Access-Control-Allow-Origin':'*'},'body':json.dumps({'message':'Deploy full code via SAM or update-function-code'})}
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Project,     Value: SALT}
+
+  # Lambda invoke permission for API Gateway
+  APIHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt APIHandlerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AssetRestApi}/*/*'
+
+  # Lambda invoke permission for EventBridge
+  CalculatorEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DepreciationCalculatorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AnnualCalculationRule.Arn
+
+  # ════════════════════════════════════════════════════════════════
+  # SECTION 5 — REST API GATEWAY (17 routes)
+  # ════════════════════════════════════════════════════════════════
+
+  AssetRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub asset-tracker-api-${Environment}
+      Description: SALT Asset Management REST API — 17 routes
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Project,     Value: SALT}
+
+  # Cognito Authorizer
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      RestApiId: !Ref AssetRestApi
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs: [!GetAtt AssetUserPool.Arn]
+
+  # Custom gateway error responses with CORS headers
+  GatewayResponse401:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref AssetRestApi
+      ResponseType: UNAUTHORIZED
+      StatusCode: '401'
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+      ResponseTemplates:
+        application/json: '{"message":"You must be logged in to access this resource"}'
+
+  GatewayResponse403:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref AssetRestApi
+      ResponseType: ACCESS_DENIED
+      StatusCode: '403'
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+      ResponseTemplates:
+        application/json: '{"message":"You do not have permission to perform this action","yourRole":"$context.authorizer.claims.cognito:groups"}'
+
+  # ── URL resources (path segments) ──────────────────────────────
+  AssetsResource:    {Type: AWS::ApiGateway::Resource, Properties: {RestApiId: !Ref AssetRestApi, ParentId: !GetAtt AssetRestApi.RootResourceId, PathPart: assets}}
+  SearchResource:    {Type: AWS::ApiGateway::Resource, Properties: {RestApiId: !Ref AssetRestApi, ParentId: !Ref AssetsResource,    PathPart: search}}
+  CategoryResource:  {Type: AWS::ApiGateway::Resource, Properties: {RestApiId: !Ref AssetRestApi, ParentId: !Ref AssetsResource,    PathPart: category}}
+  CatValResource:    {Type: AWS::ApiGateway::Resource, Properties: {RestApiId: !Ref AssetRestApi, ParentId: !Ref CategoryResource,  PathPart: '{cat}'}}
+  StatusResource:    {Type: AWS::ApiGateway::Resource, Properties: {RestApiId: !Ref AssetRestApi, ParentId: !Ref AssetsResource,    PathPart: status}}
+  StatusValResource: {Type: AWS::ApiGateway::Resource, Properties: {RestApiId: !Ref AssetRestApi, ParentId: !Ref StatusResource,    PathPart: '{status}'}}
+  DeptResource:      {Type: AWS::ApiGateway::Resource, Properties: {RestApiId: !Ref AssetRestApi, ParentId: !Ref AssetsResource,    PathPart: department}}
+  DeptValResource:   {Type: AWS::ApiGateway::Resource, Properties: {RestApiId: !Ref AssetRestApi, ParentId: !Ref DeptResource,      PathPart: '{dept}'}}
+  AssetIdResource:   {Type: AWS::ApiGateway::Resource, Properties: {RestApiId: !Ref AssetRestApi, ParentId: !Ref AssetsResource,    PathPart: '{id}'}}
+  HistoryResource:   {Type: AWS::ApiGateway::Resource, Properties: {RestApiId: !Ref AssetRestApi, ParentId: !Ref AssetIdResource,   PathPart: history}}
+  MaintResource:     {Type: AWS::ApiGateway::Resource, Properties: {RestApiId: !Ref AssetRestApi, ParentId: !Ref AssetIdResource,   PathPart: maintenance}}
+  MaintRecResource:  {Type: AWS::ApiGateway::Resource, Properties: {RestApiId: !Ref AssetRestApi, ParentId: !Ref MaintResource,     PathPart: recommendation}}
+  CondResource:      {Type: AWS::ApiGateway::Resource, Properties: {RestApiId: !Ref AssetRestApi, ParentId: !Ref AssetIdResource,   PathPart: condition}}
+  PhotoResource:     {Type: AWS::ApiGateway::Resource, Properties: {RestApiId: !Ref AssetRestApi, ParentId: !Ref AssetIdResource,   PathPart: photo}}
+  AIReviewResource:  {Type: AWS::ApiGateway::Resource, Properties: {RestApiId: !Ref AssetRestApi, ParentId: !Ref AssetIdResource,   PathPart: ai-review}}
+  ReportsResource:   {Type: AWS::ApiGateway::Resource, Properties: {RestApiId: !Ref AssetRestApi, ParentId: !GetAtt AssetRestApi.RootResourceId, PathPart: reports}}
+
+  # ── Helper macro for Lambda proxy method ───────────────────────
+  # Each method: AuthType=COGNITO, IntegrationType=AWS_PROXY
+  # POST to Lambda (Lambda Proxy always uses POST regardless of HTTP method)
+
+  # Original 9 routes
+  M01: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref AssetsResource,    HttpMethod: GET,    AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+  M02: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref AssetsResource,    HttpMethod: POST,   AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+  M03: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref AssetIdResource,   HttpMethod: GET,    AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+  M04: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref AssetIdResource,   HttpMethod: PUT,    AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+  M05: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref AssetIdResource,   HttpMethod: DELETE, AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+  M06: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref HistoryResource,   HttpMethod: GET,    AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+  M07: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref MaintResource,     HttpMethod: POST,   AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+  M08: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref CondResource,      HttpMethod: POST,   AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+  M09: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref ReportsResource,   HttpMethod: GET,    AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+  # New 8 routes
+  M10: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref SearchResource,    HttpMethod: GET,    AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+  M11: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref CatValResource,    HttpMethod: GET,    AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+  M12: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref StatusValResource, HttpMethod: GET,    AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+  M13: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref DeptValResource,   HttpMethod: GET,    AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+  M14: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref MaintRecResource,  HttpMethod: GET,    AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+  M15: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref MaintRecResource,  HttpMethod: POST,   AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+  M16: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref PhotoResource,     HttpMethod: POST,   AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+  M17: {Type: AWS::ApiGateway::Method, Properties: {RestApiId: !Ref AssetRestApi, ResourceId: !Ref AIReviewResource,  HttpMethod: POST,   AuthorizationType: COGNITO_USER_POOLS, AuthorizerId: !Ref CognitoAuthorizer, Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations'}}}
+
+  # Deploy all 17 methods to Prod stage
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [M01,M02,M03,M04,M05,M06,M07,M08,M09,M10,M11,M12,M13,M14,M15,M16,M17]
+    Properties:
+      RestApiId: !Ref AssetRestApi
+      Description: !Sub 'SALT API deployment — ${Environment}'
+
+  ApiProdStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref AssetRestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: Prod
+      Description: Production stage
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+
+  # ════════════════════════════════════════════════════════════════
+  # SECTION 6 — EVENTBRIDGE ANNUAL DEPRECIATION SCHEDULE
+  # ════════════════════════════════════════════════════════════════
+
+  AnnualCalculationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub SALT-AnnualDepreciation-${Environment}
+      Description: Runs depreciation calculator for all assets every January 1st at 09:00 UTC
+      ScheduleExpression: 'cron(0 9 1 1 ? *)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DepreciationCalculatorFunction.Arn
+          Id: DepreciationCalculatorTarget
+          Input: '{}'
+
+  # ════════════════════════════════════════════════════════════════
+  # SECTION 7 — AWS AMPLIFY HOSTING
+  # ════════════════════════════════════════════════════════════════
+
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: !Sub SALT-AssetTracker-${Environment}
+      Description: Smart Asset Lifecycle Tracker — React frontend
+      Repository: !Ref GitHubRepo
+      AccessToken: !Ref AmplifyToken
+      BuildSpec: |
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - cd amplify-app
+                - npm install
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            baseDirectory: amplify-app/build
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - amplify-app/node_modules/**/*
+      EnvironmentVariables:
+        - Name: VITE_API_ENDPOINT
+          Value: !Sub 'https://${AssetRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod'
+        - Name: VITE_USER_POOL_ID
+          Value: !Ref AssetUserPool
+        - Name: VITE_USER_POOL_CLIENT_ID
+          Value: !Ref AssetUserPoolClient
+        - Name: VITE_COGNITO_DOMAIN
+          Value: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+        - Name: VITE_PHOTO_BUCKET
+          Value: !Ref PhotoBucketName
+        - Name: VITE_REGION
+          Value: !Ref AWS::Region
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Project,     Value: SALT}
+
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: !Ref GitHubBranch
+      Description: !Sub 'SALT ${GitHubBranch} branch'
+      EnableAutoBuild: true
+      EnvironmentVariables:
+        - Name: AMPLIFY_MONOREPO_APP_ROOT
+          Value: amplify-app
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+
+# ════════════════════════════════════════════════════════════════
+# OUTPUTS
+# ════════════════════════════════════════════════════════════════
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID — add to aws-exports.js
+    Value: !Ref AssetUserPool
+    Export:
+      Name: !Sub SALT-${Environment}-UserPoolId
+
+  UserPoolClientId:
+    Description: Cognito App Client ID — add to aws-exports.js
+    Value: !Ref AssetUserPoolClient
+    Export:
+      Name: !Sub SALT-${Environment}-UserPoolClientId
+
+  CognitoDomain:
+    Description: Cognito Hosted UI domain
+    Value: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+    Export:
+      Name: !Sub SALT-${Environment}-CognitoDomain
+
+  ApiEndpoint:
+    Description: API Gateway base URL — add to aws-exports.js
+    Value: !Sub 'https://${AssetRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod'
+    Export:
+      Name: !Sub SALT-${Environment}-ApiEndpoint
+
+  PhotoBucket:
+    Description: S3 bucket for asset photographs
+    Value: !Ref AssetPhotoBucket
+    Export:
+      Name: !Sub SALT-${Environment}-PhotoBucket
+
+  AmplifyAppUrl:
+    Description: Amplify Hosting URL — update aws-exports.js redirects after first deploy
+    Value: !Sub 'https://main.${AmplifyApp.DefaultDomain}'
+    Export:
+      Name: !Sub SALT-${Environment}-AmplifyUrl
+
+  LoginUrl:
+    Description: Cognito Hosted UI login URL
+    Value: !Sub
+      - 'https://${Domain}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${ClientId}&response_type=code&scope=email+openid&redirect_uri=https://main.${AppDomain}'
+      - Domain: !Ref CognitoDomainPrefix
+        ClientId: !Ref AssetUserPoolClient
+        AppDomain: !GetAtt AmplifyApp.DefaultDomain
+
+  DeployStack1First:
+    Description: Deployment order reminder
+    Value: 'Deploy dynamodb.yaml FIRST then this app-complete.yaml stack'

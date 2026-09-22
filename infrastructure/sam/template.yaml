@@ -1,0 +1,340 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SALT - Smart Asset Lifecycle Tracker
+  STACK 2 OF 2: SAM Application stack.
+  Deploy dynamodb.yaml (CloudFormation) FIRST then this SAM template.
+  Contains: Cognito, S3 Photo Bucket, IAM Role,
+  Depreciation Calculator Lambda, API Handler Lambda (17 routes),
+  REST API Gateway with Cognito Authorizer and CORS,
+  EventBridge annual schedule, AWS Amplify Hosting.
+  DynamoDB table is referenced by name parameter — deploy dynamodb.yaml first.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  TableName:
+    Type: String
+    Default: AssetManagement
+    Description: Must match the TableName used in the dynamodb.yaml stack
+
+  CognitoDomainPrefix:
+    Type: String
+    Default: asset-tracker-salt-2026
+    Description: Globally unique Cognito domain prefix
+
+  PhotoBucketName:
+    Type: String
+    Default: asset-tracker-photos-137696816941
+    Description: Globally unique S3 bucket name
+
+  GitHubRepo:
+    Type: String
+    Default: https://github.com/mrleom/SALT
+    Description: GitHub repository URL for Amplify Hosting
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch to auto-deploy to Amplify Hosting
+
+  AmplifyToken:
+    Type: String
+    Default: REPLACE_WITH_GITHUB_TOKEN
+    NoEcho: true
+    Description: GitHub personal access token (repo scope)
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 256
+    Environment:
+      Variables:
+        TABLE_NAME:          !Ref TableName
+        PHOTO_BUCKET:        !Ref PhotoBucketName
+        CALCULATOR_FUNCTION: !Sub AssetDepreciationCalculator-${Environment}
+
+Resources:
+
+  # ════════════════════════════════════════════════════════════════
+  # SECTION 1 — AMAZON COGNITO
+  # ════════════════════════════════════════════════════════════════
+
+  AssetUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub asset-tracker-pool-${Environment}
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      PasswordPolicy:
+        MinimumLength: 8
+        RequireUppercase: true
+        RequireLowercase: true
+        RequireNumbers: true
+        RequireSymbols: true
+
+  AssetUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref CognitoDomainPrefix
+      UserPoolId: !Ref AssetUserPool
+
+  AssetUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: AmplifyBranch
+    Properties:
+      ClientName: !Sub asset-tracker-client-${Environment}
+      UserPoolId: !Ref AssetUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      AllowedOAuthFlows: [code, implicit]
+      AllowedOAuthScopes: [email, openid, profile]
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs:
+        - https://localhost
+        - !Sub 'https://main.${AmplifyApp.DefaultDomain}'
+      LogoutURLs:
+        - https://localhost
+        - !Sub 'https://main.${AmplifyApp.DefaultDomain}'
+      SupportedIdentityProviders: [COGNITO]
+
+  AdminGroup:      {Type: AWS::Cognito::UserPoolGroup, Properties: {GroupName: Administrator, UserPoolId: !Ref AssetUserPool, Precedence: 1, Description: Full access}}
+  AuditorGroup:    {Type: AWS::Cognito::UserPoolGroup, Properties: {GroupName: Auditor,       UserPoolId: !Ref AssetUserPool, Precedence: 2, Description: Read-only}}
+  ManagerGroup:    {Type: AWS::Cognito::UserPoolGroup, Properties: {GroupName: Manager,       UserPoolId: !Ref AssetUserPool, Precedence: 3, Description: Dept view and reports}}
+  TechnicianGroup: {Type: AWS::Cognito::UserPoolGroup, Properties: {GroupName: Technician,    UserPoolId: !Ref AssetUserPool, Precedence: 4, Description: Update and maintenance}}
+  EmployeeGroup:   {Type: AWS::Cognito::UserPoolGroup, Properties: {GroupName: Employee,      UserPoolId: !Ref AssetUserPool, Precedence: 5, Description: View own assets}}
+
+  # ════════════════════════════════════════════════════════════════
+  # SECTION 2 — S3 PHOTO BUCKET
+  # ════════════════════════════════════════════════════════════════
+
+  AssetPhotoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref PhotoBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, DELETE, HEAD]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  # ════════════════════════════════════════════════════════════════
+  # SECTION 3 — LAMBDA FUNCTIONS
+  # ════════════════════════════════════════════════════════════════
+
+  # ── Lambda 1: Depreciation Calculator ──────────────────────────
+  DepreciationCalculatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub AssetDepreciationCalculator-${Environment}
+      Handler: calculator/app.handler
+      CodeUri: functions/
+      Timeout: 120
+      Description: Straight-line depreciation for one or all assets
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableName
+      Events:
+        AnnualSchedule:
+          Type: Schedule
+          Properties:
+            Name: !Sub SALT-AnnualDepreciation-${Environment}
+            Description: Annual depreciation reconciliation every January 1st at 09:00 UTC
+            Schedule: 'cron(0 9 1 1 ? *)'
+            Input: '{}'
+            Enabled: true
+
+  # ── Lambda 2: API Handler — all 17 routes with RBAC ────────────
+  APIHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub AssetAPIHandler-${Environment}
+      Handler: apihandler/app.handler
+      CodeUri: functions/
+      Timeout: 30
+      Description: >
+        17 REST API routes with Cognito RBAC.
+        Generates maintenance recommendations on every save.
+        Invokes depreciation calculator synchronously after asset write.
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableName
+        - S3CrudPolicy:
+            BucketName: !Ref PhotoBucketName
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt DepreciationCalculatorFunction.Arn
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource: 'arn:aws:bedrock:us-east-1::foundation-model/*'
+      Events:
+        # Original 9 routes
+        GetAssets:       {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /assets,                              Method: GET,    Auth: {Authorizer: CognitoAuthorizer}}}
+        PostAssets:      {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /assets,                              Method: POST,   Auth: {Authorizer: CognitoAuthorizer}}}
+        GetAssetById:    {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /assets/{id},                         Method: GET,    Auth: {Authorizer: CognitoAuthorizer}}}
+        PutAsset:        {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /assets/{id},                         Method: PUT,    Auth: {Authorizer: CognitoAuthorizer}}}
+        DeleteAsset:     {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /assets/{id},                         Method: DELETE, Auth: {Authorizer: CognitoAuthorizer}}}
+        GetHistory:      {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /assets/{id}/history,                 Method: GET,    Auth: {Authorizer: CognitoAuthorizer}}}
+        PostMaintenance: {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /assets/{id}/maintenance,             Method: POST,   Auth: {Authorizer: CognitoAuthorizer}}}
+        PostCondition:   {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /assets/{id}/condition,               Method: POST,   Auth: {Authorizer: CognitoAuthorizer}}}
+        GetReports:      {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /reports,                             Method: GET,    Auth: {Authorizer: CognitoAuthorizer}}}
+        # New 8 routes
+        GetSearch:       {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /assets/search,                       Method: GET,    Auth: {Authorizer: CognitoAuthorizer}}}
+        GetByCategory:   {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /assets/category/{cat},               Method: GET,    Auth: {Authorizer: CognitoAuthorizer}}}
+        GetByStatus:     {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /assets/status/{status},              Method: GET,    Auth: {Authorizer: CognitoAuthorizer}}}
+        GetByDept:       {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /assets/department/{dept},            Method: GET,    Auth: {Authorizer: CognitoAuthorizer}}}
+        GetMaintRec:     {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /assets/{id}/maintenance/recommendation, Method: GET, Auth: {Authorizer: CognitoAuthorizer}}}
+        PostMaintRec:    {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /assets/{id}/maintenance/recommendation, Method: POST, Auth: {Authorizer: CognitoAuthorizer}}}
+        PostPhoto:       {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /assets/{id}/photo,                   Method: POST,   Auth: {Authorizer: CognitoAuthorizer}}}
+        PostAIReview:    {Type: Api, Properties: {RestApiId: !Ref AssetRestApi, Path: /assets/{id}/ai-review,               Method: POST,   Auth: {Authorizer: CognitoAuthorizer}}}
+
+  # ════════════════════════════════════════════════════════════════
+  # SECTION 4 — REST API GATEWAY WITH COGNITO AUTHORIZER AND CORS
+  # ════════════════════════════════════════════════════════════════
+
+  AssetRestApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub asset-tracker-api-${Environment}
+      StageName: Prod
+      EndpointConfiguration:
+        Type: REGIONAL
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt AssetUserPool.Arn
+            Identity:
+              Header: Authorization
+      GatewayResponses:
+        UNAUTHORIZED:
+          StatusCode: 401
+          ResponseTemplates:
+            application/json: '{"message":"You must be logged in to access this resource"}'
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin:  "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        ACCESS_DENIED:
+          StatusCode: 403
+          ResponseTemplates:
+            application/json: '{"message":"You do not have permission","yourRole":"$context.authorizer.claims.cognito:groups"}'
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin:  "'*'"
+
+  # ════════════════════════════════════════════════════════════════
+  # SECTION 5 — AWS AMPLIFY HOSTING
+  # ════════════════════════════════════════════════════════════════
+
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: !Sub SALT-AssetTracker-${Environment}
+      Description: Smart Asset Lifecycle Tracker — React Vite frontend
+      Repository: !Ref GitHubRepo
+      AccessToken: !Ref AmplifyToken
+      BuildSpec: |
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - cd amplify-app
+                - npm install
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            baseDirectory: amplify-app/build
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - amplify-app/node_modules/**/*
+      EnvironmentVariables:
+        - Name: VITE_API_ENDPOINT
+          Value: !Sub 'https://${AssetRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod'
+        - Name: VITE_USER_POOL_ID
+          Value: !Ref AssetUserPool
+        - Name: VITE_USER_POOL_CLIENT_ID
+          Value: !Ref AssetUserPoolClient
+        - Name: VITE_COGNITO_DOMAIN
+          Value: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+        - Name: VITE_PHOTO_BUCKET
+          Value: !Ref PhotoBucketName
+        - Name: VITE_REGION
+          Value: !Ref AWS::Region
+
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: !Ref GitHubBranch
+      Description: !Sub 'SALT ${GitHubBranch} auto-deploy'
+      EnableAutoBuild: true
+
+# ════════════════════════════════════════════════════════════════
+# OUTPUTS
+# ════════════════════════════════════════════════════════════════
+Outputs:
+  UserPoolId:
+    Value: !Ref AssetUserPool
+    Description: Cognito User Pool ID
+
+  UserPoolClientId:
+    Value: !Ref AssetUserPoolClient
+    Description: Cognito App Client ID
+
+  CognitoDomain:
+    Value: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+    Description: Cognito Hosted UI base domain
+
+  ApiEndpoint:
+    Value: !Sub 'https://${AssetRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod'
+    Description: API Gateway invoke URL
+
+  PhotoBucket:
+    Value: !Ref AssetPhotoBucket
+    Description: S3 bucket for asset photographs
+
+  AmplifyAppUrl:
+    Value: !Sub 'https://main.${AmplifyApp.DefaultDomain}'
+    Description: Amplify Hosting URL
+
+  LoginUrl:
+    Value: !Sub
+      - 'https://${Domain}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${ClientId}&response_type=code&scope=email+openid&redirect_uri=https://main.${AppDomain}'
+      - Domain: !Ref CognitoDomainPrefix
+        ClientId: !Ref AssetUserPoolClient
+        AppDomain: !GetAtt AmplifyApp.DefaultDomain
+    Description: Cognito Hosted UI login URL
+
+  DeployOrder:
+    Value: 'Step 1: deploy dynamodb.yaml  Step 2: sam build && sam deploy this template'
+    Description: Deployment order

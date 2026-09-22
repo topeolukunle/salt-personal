@@ -1,0 +1,116 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SALT - Smart Asset Lifecycle Tracker
+  STACK 1 OF 2: DynamoDB Table only.
+  Deploy this first. The app stack (app-complete.yaml or SAM template.yaml)
+  imports the table name via cross-stack reference or parameter.
+  Kept separate so the table can be shared with any future application
+  without recreating it.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  TableName:
+    Type: String
+    Default: AssetManagement
+
+Resources:
+
+  AssetManagementTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: false
+      KeySchema:
+        - AttributeName: asset_id
+          KeyType: HASH
+        - AttributeName: record_type
+          KeyType: RANGE
+      AttributeDefinitions:
+        - {AttributeName: asset_id,                     AttributeType: S}
+        - {AttributeName: record_type,                  AttributeType: S}
+        - {AttributeName: event_date,                   AttributeType: S}
+        - {AttributeName: maintenance_cost,             AttributeType: N}
+        - {AttributeName: status,                       AttributeType: S}
+        - {AttributeName: category,                     AttributeType: S}
+        - {AttributeName: building,                     AttributeType: S}
+        - {AttributeName: assigned_to,                  AttributeType: S}
+        - {AttributeName: assigned_department,          AttributeType: S}
+        - {AttributeName: acquired_date,                AttributeType: S}
+        - {AttributeName: recommended_next_maintenance, AttributeType: S}
+      LocalSecondaryIndexes:
+        - IndexName: asset-by-date-index
+          KeySchema:
+            - {AttributeName: asset_id,  KeyType: HASH}
+            - {AttributeName: event_date, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: asset-by-cost-index
+          KeySchema:
+            - {AttributeName: asset_id,         KeyType: HASH}
+            - {AttributeName: maintenance_cost,  KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      GlobalSecondaryIndexes:
+        - IndexName: status-index
+          KeySchema:
+            - {AttributeName: status,        KeyType: HASH}
+            - {AttributeName: acquired_date, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: category-index
+          KeySchema:
+            - {AttributeName: category,      KeyType: HASH}
+            - {AttributeName: acquired_date, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: location-index
+          KeySchema:
+            - {AttributeName: building,    KeyType: HASH}
+            - {AttributeName: record_type, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: assigned-index
+          KeySchema:
+            - {AttributeName: assigned_to, KeyType: HASH}
+            - {AttributeName: record_type, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: assigned-department-index
+          KeySchema:
+            - {AttributeName: assigned_department, KeyType: HASH}
+            - {AttributeName: record_type,         KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: maintenance-due-index
+          KeySchema:
+            - {AttributeName: status,                       KeyType: HASH}
+            - {AttributeName: recommended_next_maintenance, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Project,     Value: SALT}
+        - {Key: ManagedBy,   Value: CloudFormation}
+
+# ── Outputs exported for cross-stack reference ──────────────────
+# The app stack imports these via Fn::ImportValue
+Outputs:
+  TableName:
+    Description: DynamoDB table name
+    Value: !Ref AssetManagementTable
+    Export:
+      Name: !Sub SALT-${Environment}-TableName
+
+  TableArn:
+    Description: DynamoDB table ARN for IAM policies
+    Value: !GetAtt AssetManagementTable.Arn
+    Export:
+      Name: !Sub SALT-${Environment}-TableArn
+
+  TableIndexArn:
+    Description: DynamoDB table index ARN wildcard for IAM policies
+    Value: !Sub '${AssetManagementTable.Arn}/index/*'
+    Export:
+      Name: !Sub SALT-${Environment}-TableIndexArn
