@@ -5,7 +5,7 @@ frontend:
       commands:
         - nvm use 20
         - cd infrastructure/sam/amplify-app
-        - npm ci
+        - npm install
     build:
       commands:
         - npm run build
