@@ -393,6 +393,7 @@ Resources:
           TABLE_NAME:          !Ref TableName
           PHOTO_BUCKET:        !Ref PhotoBucketName
           CALCULATOR_FUNCTION: !Sub AssetDepreciationCalculator-${Environment}
+	  ALLOWED_ORIGIN:      !Sub 'https://main.${AmplifyApp.DefaultDomain}'	
       Code:
         ZipFile: |
           import json
@@ -455,7 +456,7 @@ Resources:
       ResponseType: UNAUTHORIZED
       StatusCode: '401'
       ResponseParameters:
-        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Origin: !Sub "'https://main.${AmplifyApp.DefaultDomain}'"
         gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
       ResponseTemplates:
         application/json: '{"message":"You must be logged in to access this resource"}'
@@ -467,7 +468,7 @@ Resources:
       ResponseType: ACCESS_DENIED
       StatusCode: '403'
       ResponseParameters:
-        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Origin: !Sub "'https://main.${AmplifyApp.DefaultDomain}'"
       ResponseTemplates:
         application/json: '{"message":"You do not have permission to perform this action","yourRole":"$context.authorizer.claims.cognito:groups"}'
 
