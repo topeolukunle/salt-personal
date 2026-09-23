@@ -393,7 +393,7 @@ Resources:
           TABLE_NAME:          !Ref TableName
           PHOTO_BUCKET:        !Ref PhotoBucketName
           CALCULATOR_FUNCTION: !Sub AssetDepreciationCalculator-${Environment}
-	  ALLOWED_ORIGIN:      !Sub 'https://main.${AmplifyApp.DefaultDomain}'	
+	      ALLOWED_ORIGIN:      !Sub 'https://main.${AmplifyApp.DefaultDomain}'	
       Code:
         ZipFile: |
           import json
