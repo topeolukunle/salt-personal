@@ -8,6 +8,7 @@ frontend:
         - npm install
     build:
       commands:
+        - cd infrastructure/sam/amplify-app
         - npm run build
   artifacts:
     baseDirectory: infrastructure/sam/amplify-app/dist
