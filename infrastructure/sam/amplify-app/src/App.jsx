@@ -22,28 +22,26 @@ import '@aws-amplify/ui-react/styles.css';
 // ============================================================
 Amplify.configure({
   Auth: {
-    region:              'us-east-1',
-    userPoolId:          'us-east-1_L8Wyacfeb',
-    userPoolWebClientId: '2o3n2ha4b7ttstgl3ur2dhhh54',
-    oauth: {
-      domain:          'us-east-1l8wyacfeb.auth.us-east-1.amazoncognito.com',
-      scope:           ['email', 'openid', 'profile'],
-      redirectSignIn:  'https://localhost',
-      redirectSignOut: 'https://localhost',
-      responseType:    'code',
+    Cognito: {
+      userPoolId:            import.meta.env.VITE_USER_POOL_ID || 'us-east-1_L8Wyacfeb',
+      userPoolClientId:      import.meta.env.VITE_CLIENT_ID    || '2o3n2ha4b7ttstgl3ur2dhhh54',
+      loginWith: {
+        oauth: {
+          domain:            'us-east-1l8wyacfeb.auth.us-east-1.amazoncognito.com',
+          scopes:            ['email', 'openid', 'profile'],
+          redirectSignIn:    [import.meta.env.VITE_APP_URL || 'https://main.d8wysdrlw98k3.amplifyapp.com'],
+          redirectSignOut:   [import.meta.env.VITE_APP_URL || 'https://main.d8wysdrlw98k3.amplifyapp.com'],
+          responseType:      'code',
+        },
+      },
     },
   },
   API: {
-    endpoints: [{
-      name:     'AssetAPI',
-      endpoint: 'https://ri44266s4g.execute-api.us-east-1.amazonaws.com/Prod',
-      region:   'us-east-1',
-    }],
-  },
-  Storage: {
-    AWSS3: {
-      bucket: 'asset-tracker-photos-137696816941',
-      region: 'us-east-1',
+    REST: {
+      AssetAPI: {
+        endpoint: import.meta.env.VITE_API_URL || 'https://ri44266s4g.execute-api.us-east-1.amazonaws.com/Prod',
+        region:   'us-east-1',
+      },
     },
   },
 });
