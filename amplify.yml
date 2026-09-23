@@ -4,12 +4,10 @@ frontend:
     preBuild:
       commands:
         - nvm use 20
-        - cd infrastructure/sam/amplify-app
-        - npm install
+        - cd infrastructure/sam/amplify-app && npm install
     build:
       commands:
-        - cd infrastructure/sam/amplify-app
-        - npm run build
+        - cd infrastructure/sam/amplify-app && npm run build
   artifacts:
     baseDirectory: infrastructure/sam/amplify-app/dist
     files:
