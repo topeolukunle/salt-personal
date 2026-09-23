@@ -1,0 +1,18 @@
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - nvm use 20
+        - cd infrastructure/sam/amplify-app
+        - npm ci
+    build:
+      commands:
+        - npm run build
+  artifacts:
+    baseDirectory: infrastructure/sam/amplify-app/dist
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - infrastructure/sam/amplify-app/node_modules/**/*
