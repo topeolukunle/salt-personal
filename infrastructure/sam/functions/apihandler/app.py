@@ -69,11 +69,19 @@ def get_user_info(event):
         claims = event['requestContext']['authorizer']['claims']
         username = claims.get('email') or claims.get('cognito:username', 'unknown')
         groups_raw = claims.get('cognito:groups', '')
-        groups = groups_raw if isinstance(groups_raw, list) else groups_raw.split(',') if groups_raw else []
-        return username, [g.strip() for g in groups]
-    except (KeyError, TypeError):
+        # Handle both string and list formats
+        if isinstance(groups_raw, list):
+            groups = groups_raw
+        elif groups_raw:
+            # API Gateway returns groups as comma-separated string
+            groups = [g.strip() for g in groups_raw.split(',')]
+        else:
+            groups = []
+        logger.info(f'User: {username}, Groups: {groups}')
+        return username, groups
+    except (KeyError, TypeError) as e:
+        logger.error(f'get_user_info error: {e}')
         return 'unknown', []
-
 
 def can(groups, *allowed_groups):
     """Return True if user belongs to any of the allowed groups."""
