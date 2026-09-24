@@ -520,9 +520,21 @@ def handle_photo_upload(event, username, groups, asset_id):
 
 
 def handle_ai_review(event, username, groups, asset_id):
-    """POST /assets/{id}/ai-review — Bedrock placeholder."""
+    """POST /assets/{id}/ai-review — invoke Amazon Nova 2 Lite with asset photo."""
     if not can(groups, 'Technician', 'Administrator'):
         return respond(403, {'message': 'Forbidden'})
+
+    # Get the asset profile to find the image_key
+    result = table.get_item(
+        Key={'asset_id': asset_id, 'record_type': 'PROFILE'}
+    )
+    profile = result.get('Item')
+    if not profile:
+        return respond(404, {'message': f'Asset {asset_id} not found'})
+
+    image_key = profile.get('image_key', 'NOT-SET')
+    if image_key == 'NOT-SET' or not image_key:
+        return respond(400, {'message': 'No photo uploaded for this asset. Upload a photo first.'})
 
     # Update status to InReview immediately
     table.update_item(
@@ -531,14 +543,130 @@ def handle_ai_review(event, username, groups, asset_id):
         ExpressionAttributeValues={':s': 'InReview', ':u': now_iso()},
     )
 
-    # TODO: invoke Bedrock here in next milestone
-    # For now return placeholder
-    return respond(202, {
-        'message': 'AI review queued (Bedrock integration pending)',
-        'asset_id': asset_id,
-        'ai_review_status': 'InReview',
-    })
+    try:
+        # Read image bytes from S3
+        s3_response = s3_client.get_object(Bucket=PHOTO_BUCKET, Key=image_key)
+        image_bytes = s3_response['Body'].read()
 
+        # Determine image format from key extension
+        ext = image_key.lower().split('.')[-1]
+        fmt_map = {'jpg': 'jpeg', 'jpeg': 'jpeg', 'png': 'png', 'webp': 'webp', 'gif': 'gif'}
+        image_format = fmt_map.get(ext, 'jpeg')
+
+        # Structured prompt
+        prompt = """You are an asset management assistant. Analyze this photograph and return ONLY a valid JSON object with no text outside the JSON.
+
+{
+  "category": "one of: IT Equipment, Furniture, Vehicle, Machinery, Office Equipment, Medical Equipment, Safety Equipment, Other",
+  "manufacturer": "manufacturer name if clearly visible, otherwise Unknown",
+  "model": "model name or family if clearly visible, otherwise Unknown",
+  "description": "factual description of the asset in 1-2 sentences based only on what is visible",
+  "condition": "one of: Excellent, Good, Fair, Poor, Critical",
+  "useful_life_years": 5,
+  "maintenance_category": "one of: Scheduled, Inspection, Cleaning, Calibration, Repair",
+  "confidence": "one of: High, Medium, Low",
+  "notes": "observations about the asset or limitations of this analysis"
+}
+
+Rules:
+- Do not invent serial numbers, purchase prices, dates or employee assignments
+- Only describe what is clearly visible
+- If image is unclear set confidence to Low
+- category and condition must be exactly one of the listed values
+- useful_life_years must be a number not a string"""
+
+        # Build Nova 2 Lite request
+        request_body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "image": {
+                                "format": image_format,
+                                "source": {
+                                    "bytes": image_bytes
+                                }
+                            }
+                        },
+                        {
+                            "text": prompt
+                        }
+                    ]
+                }
+            ],
+            "inferenceConfig": {
+                "max_new_tokens": 500,
+                "temperature": 0.1
+            }
+        }
+
+        # Invoke Bedrock
+        bedrock = boto3.client(
+            'bedrock-runtime',
+            region_name=os.environ.get('REGION', 'us-east-1')
+        )
+
+        bedrock_response = bedrock.invoke_model(
+            modelId='amazon.nova-2-lite-v1:0',
+            body=json.dumps(request_body),
+            contentType='application/json',
+            accept='application/json'
+        )
+
+        response_body = json.loads(bedrock_response['body'].read())
+        output_text = response_body['output']['message']['content'][0]['text']
+
+        # Extract JSON from response
+        import re
+        json_match = re.search(r'\{.*\}', output_text, re.DOTALL)
+        if not json_match:
+            raise ValueError('No JSON found in Bedrock response')
+
+        suggestions = json.loads(json_match.group())
+
+        # Save AI review results to DynamoDB
+        table.update_item(
+            Key={'asset_id': asset_id, 'record_type': 'PROFILE'},
+            UpdateExpression='''SET
+                ai_review_status    = :status,
+                ai_confidence_score = :confidence,
+                ai_review_notes     = :notes,
+                updated_at          = :u''',
+            ExpressionAttributeValues={
+                ':status':     'Reviewed',
+                ':confidence': suggestions.get('confidence', 'Low'),
+                ':notes':      suggestions.get('notes', ''),
+                ':u':          now_iso(),
+            }
+        )
+
+        return respond(200, {
+            'asset_id':         asset_id,
+            'suggestions':      suggestions,
+            'ai_review_status': 'Reviewed',
+            'message':          'AI analysis complete. Review and confirm the suggestions.'
+        })
+
+    except Exception as e:
+        logger.error(f'Bedrock error for {asset_id}: {e}')
+
+        # Update status to Failed
+        table.update_item(
+            Key={'asset_id': asset_id, 'record_type': 'PROFILE'},
+            UpdateExpression='SET ai_review_status = :s, ai_review_notes = :n, updated_at = :u',
+            ExpressionAttributeValues={
+                ':s': 'Failed',
+                ':n': str(e),
+                ':u': now_iso(),
+            }
+        )
+
+        return respond(500, {
+            'asset_id':         asset_id,
+            'ai_review_status': 'Failed',
+            'message':          f'AI review failed: {str(e)}'
+        })
 
 def handle_filter_by_ai_status(event, username, groups, status):
     """GET /assets/ai-review-status/{status} — uses ai-review-status-index GSI."""
