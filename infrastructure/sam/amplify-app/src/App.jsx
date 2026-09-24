@@ -125,8 +125,8 @@ const api = {
   getReports:            ()        => req('GET',    '/reports'),
 };
 async function uploadPhoto(assetId, file) {
-  const { upload_url, key } = await api.getPhotoUrl(assetId, file.type || 'image/jpeg');
-  await fetch(upload_url, { method: 'PUT', body: file, headers: { 'Content-Type': file.type || 'image/jpeg' } });
+  const { presigned_url, key } = await api.getPhotoUrl(assetId, file.type || 'image/jpeg');
+  await fetch(presigned_url, { method: 'PUT', body: file, headers: { 'Content-Type': file.type || 'image/jpeg' } });
   return key;
 }
 
