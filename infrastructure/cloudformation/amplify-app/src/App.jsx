@@ -17,33 +17,29 @@ import '@aws-amplify/ui-react/styles.css';
 
 // ============================================================
 // AMPLIFY CONFIGURATION
-// Update redirectSignIn and redirectSignOut after first deploy
-// Replace https://localhost with your Amplify app URL
 // ============================================================
 Amplify.configure({
   Auth: {
-    region:              'us-east-1',
-    userPoolId:          'us-east-1_L8Wyacfeb',
-    userPoolWebClientId: '2o3n2ha4b7ttstgl3ur2dhhh54',
-    oauth: {
-      domain:          'us-east-1l8wyacfeb.auth.us-east-1.amazoncognito.com',
-      scope:           ['email', 'openid', 'profile'],
-      redirectSignIn:  'https://localhost',
-      redirectSignOut: 'https://localhost',
-      responseType:    'code',
+    Cognito: {
+      userPoolId:       import.meta.env.VITE_USER_POOL_ID,
+      userPoolClientId: import.meta.env.VITE_CLIENT_ID,
+      loginWith: {
+        oauth: {
+          domain:          'us-east-1l8wyacfeb.auth.us-east-1.amazoncognito.com',
+          scopes:          ['email', 'openid', 'profile'],
+          redirectSignIn:  [import.meta.env.VITE_APP_URL],
+          redirectSignOut: [import.meta.env.VITE_APP_URL],
+          responseType:    'code',
+        },
+      },
     },
   },
   API: {
-    endpoints: [{
-      name:     'AssetAPI',
-      endpoint: 'https://ri44266s4g.execute-api.us-east-1.amazonaws.com/Prod',
-      region:   'us-east-1',
-    }],
-  },
-  Storage: {
-    AWSS3: {
-      bucket: 'asset-tracker-photos-137696816941',
-      region: 'us-east-1',
+    REST: {
+      AssetAPI: {
+        endpoint: import.meta.env.VITE_API_URL,
+        region:   'us-east-1',
+      },
     },
   },
 });
@@ -51,7 +47,7 @@ Amplify.configure({
 // ============================================================
 // CONSTANTS
 // ============================================================
-const BASE_URL    = 'https://ri44266s4g.execute-api.us-east-1.amazonaws.com/Prod';
+const BASE_URL    = import.meta.env.VITE_API_URL || 'https://ri44266s4g.execute-api.us-east-1.amazonaws.com/Prod';
 const CATEGORIES  = ['IT Equipment','Networking','Machinery','Vehicle','Furniture','Tools','Mobile Device','Printer','Server','Other'];
 const STATUSES    = ['Available','Assigned','Checked Out','In Maintenance','Damaged','Lost','Stolen','Retired'];
 const CONDITIONS  = ['Excellent','Good','Fair','Poor','Critical'];
@@ -111,26 +107,26 @@ async function req(method, path, body = null) {
   return data;
 }
 const api = {
-  getAssets:           ()        => req('GET',    '/assets'),
-  getAsset:            id        => req('GET',    `/assets/${id}`),
-  createAsset:         body      => req('POST',   '/assets', body),
-  updateAsset:         (id,body) => req('PUT',    `/assets/${id}`, body),
-  deleteAsset:         id        => req('DELETE', `/assets/${id}`),
-  getHistory:          id        => req('GET',    `/assets/${id}/history`),
-  addMaintenance:      (id,body) => req('POST',   `/assets/${id}/maintenance`, body),
-  addCondition:        (id,body) => req('POST',   `/assets/${id}/condition`, body),
-  getRecommendation:   id        => req('GET',    `/assets/${id}/maintenance/recommendation`),
-  refreshRecommendation:id       => req('POST',   `/assets/${id}/maintenance/recommendation`, {}),
-  getPhotoUrl:         (id,ct)   => req('POST',   `/assets/${id}/photo`, { content_type: ct }),
-  search:              q         => req('GET',    `/assets/search?q=${encodeURIComponent(q)}`),
-  getByCategory:       cat       => req('GET',    `/assets/category/${encodeURIComponent(cat)}`),
-  getByStatus:         status    => req('GET',    `/assets/status/${encodeURIComponent(status)}`),
-  getByDepartment:     dept      => req('GET',    `/assets/department/${encodeURIComponent(dept)}`),
-  getReports:          ()        => req('GET',    '/reports'),
+  getAssets:             ()        => req('GET',    '/assets').then(r => r.assets   || r),
+  getAsset:              id        => req('GET',    `/assets/${id}`).then(r => r.records || r),
+  createAsset:           body      => req('POST',   '/assets', body),
+  updateAsset:           (id,body) => req('PUT',    `/assets/${id}`, body),
+  deleteAsset:           id        => req('DELETE', `/assets/${id}`),
+  getHistory:            id        => req('GET',    `/assets/${id}/history`).then(r => r.history || r),
+  addMaintenance:        (id,body) => req('POST',   `/assets/${id}/maintenance`, body),
+  addCondition:          (id,body) => req('POST',   `/assets/${id}/condition`, body),
+  getRecommendation:     id        => req('GET',    `/assets/${id}/maintenance/recommendation`),
+  refreshRecommendation: id        => req('POST',   `/assets/${id}/maintenance/recommendation`, {}),
+  getPhotoUrl:           (id,ct)   => req('POST',   `/assets/${id}/photo`, { content_type: ct }),
+  search:                q         => req('GET',    `/assets/search?q=${encodeURIComponent(q)}`).then(r => r.results || r),
+  getByCategory:         cat       => req('GET',    `/assets/category/${encodeURIComponent(cat)}`).then(r => r.assets || r),
+  getByStatus:           status    => req('GET',    `/assets/status/${encodeURIComponent(status)}`).then(r => r.assets  || r),
+  getByDepartment:       dept      => req('GET',    `/assets/department/${encodeURIComponent(dept)}`).then(r => r.assets || r),
+  getReports:            ()        => req('GET',    '/reports'),
 };
 async function uploadPhoto(assetId, file) {
-  const { upload_url, key } = await api.getPhotoUrl(assetId, file.type || 'image/jpeg');
-  await fetch(upload_url, { method: 'PUT', body: file, headers: { 'Content-Type': file.type || 'image/jpeg' } });
+  const { presigned_url, key } = await api.getPhotoUrl(assetId, file.type || 'image/jpeg');
+  await fetch(presigned_url, { method: 'PUT', body: file, headers: { 'Content-Type': file.type || 'image/jpeg' } });
   return key;
 }
 
@@ -288,7 +284,8 @@ function Dashboard() {
     (async () => {
       try {
         const [a, r] = await Promise.all([api.getAssets(), can('reports') ? api.getReports() : null]);
-        setAssets(a); setStats(r);
+        setAssets(Array.isArray(a) ? a : []);
+        setStats(r);
       } catch(e) { setError(e.message); }
       finally { setLoading(false); }
     })();
@@ -319,8 +316,8 @@ function Dashboard() {
             {Object.entries(stats.by_category).map(([cat,data]) => (
               <div key={cat} style={{ padding:'12px 14px', background:'var(--surface)', borderRadius:'var(--radius)', border:'1px solid var(--border)' }}>
                 <div style={{ fontSize:13, fontWeight:600, marginBottom:4 }}>{cat}</div>
-                <div style={{ fontSize:22, fontWeight:700, color:'var(--navy)', marginBottom:2 }}>{data.count}</div>
-                <div className="text-sm text-lt">{fmtCurrency(data.book_value)}</div>
+                <div style={{ fontSize:22, fontWeight:700, color:'var(--navy)', marginBottom:2 }}>{typeof data === 'object' ? data.count : data}</div>
+                <div className="text-sm text-lt">{typeof data === 'object' ? fmtCurrency(data.book_value) : ''}</div>
               </div>
             ))}
           </div>
@@ -367,7 +364,8 @@ function AssetList() {
       else if (catFilter)   data = await api.getByCategory(catFilter);
       else if (statFilter)  data = await api.getByStatus(statFilter);
       else                  data = await api.getAssets();
-      setAssets(data.filter(i => !i.record_type || i.record_type === 'PROFILE'));
+      const arr = Array.isArray(data) ? data : (data.assets || data.results || []);
+      setAssets(arr.filter(i => !i.record_type || i.record_type === 'PROFILE'));
     } catch(e) { setError(e.message); }
     finally { setLoading(false); }
   }, [search, catFilter, statFilter]);
@@ -449,7 +447,7 @@ function AssetDetail() {
     (async () => {
       try {
         const [recs, recommendation] = await Promise.all([api.getAsset(id), api.getRecommendation(id).catch(() => null)]);
-        setRecords(recs); setRec(recommendation);
+        setRecords(Array.isArray(recs) ? recs : []); setRec(recommendation);
       } catch(e) { setError(e.message); }
       finally { setLoading(false); }
     })();
@@ -807,10 +805,11 @@ function EditAsset() {
     (async () => {
       try {
         const records = await api.getAsset(id);
-        const p = records.find(r=>r.record_type==='PROFILE')    || {};
-        const f = records.find(r=>r.record_type==='FINANCIALS') || {};
-        const s = records.find(r=>r.record_type==='STATUS')     || {};
-        const l = records.filter(r=>r.record_type?.startsWith('LOCATION#')).sort((a,b)=>b.event_date?.localeCompare(a.event_date))[0] || {};
+        const arr = Array.isArray(records) ? records : [];
+        const p = arr.find(r=>r.record_type==='PROFILE')    || {};
+        const f = arr.find(r=>r.record_type==='FINANCIALS') || {};
+        const s = arr.find(r=>r.record_type==='STATUS')     || {};
+        const l = arr.filter(r=>r.record_type?.startsWith('LOCATION#')).sort((a,b)=>b.event_date?.localeCompare(a.event_date))[0] || {};
         const ns = v => v==='NOT-SET' ? '' : (v||'');
         setForm({
           name:p.name||'', description:p.description||'', category:p.category||'IT Equipment',
@@ -969,7 +968,7 @@ function Reports() {
     <div>
       <div style={{ marginBottom:24 }}>
         <h1 style={{ marginBottom:4 }}>Asset Reports</h1>
-        <p className="text-lt text-sm">Generated {fmtDate(report.generated_at)} by {report.generated_by} ({report.role})</p>
+        <p className="text-lt text-sm">Generated {fmtDate(report.generated_at)}</p>
       </div>
       <div className="stat-grid" style={{ marginBottom:24 }}>
         <StatCard label="Total Assets"        value={report.total_assets}                        sub="registered assets" />
@@ -982,12 +981,12 @@ function Reports() {
         <Card title="Breakdown by Category">
           <div className="table-wrap"><table>
             <thead><tr><th>Category</th><th>Count</th><th>Total Book Value</th><th>Avg Book Value</th></tr></thead>
-            <tbody>{Object.entries(report.by_category).sort((a,b)=>b[1].book_value-a[1].book_value).map(([cat,data]) => (
+            <tbody>{Object.entries(report.by_category).sort((a,b)=>b[1]-a[1]).map(([cat,count]) => (
               <tr key={cat}>
                 <td style={{ fontWeight:500 }}>{cat}</td>
-                <td>{data.count}</td>
-                <td>{fmtCurrency(data.book_value)}</td>
-                <td>{fmtCurrency(data.book_value/data.count)}</td>
+                <td>{typeof count === 'object' ? count.count : count}</td>
+                <td>{typeof count === 'object' ? fmtCurrency(count.book_value) : '—'}</td>
+                <td>{typeof count === 'object' && count.count ? fmtCurrency(count.book_value/count.count) : '—'}</td>
               </tr>
             ))}</tbody>
           </table></div>
