@@ -496,7 +496,7 @@ def handle_photo_upload(event, username, groups, asset_id):
         return respond(403, {'message': 'Forbidden'})
 
     body = json.loads(event.get('body') or '{}')
-    file_type = body.get('file_type', 'image/jpeg')
+    file_type = body.get('content_type') or body.get('file_type', 'image/jpeg')
     ext_map = {'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp'}
     ext = ext_map.get(file_type, 'jpg')
 
