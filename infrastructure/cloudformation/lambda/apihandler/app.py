@@ -3,6 +3,7 @@ import boto3
 import os
 import uuid
 import logging
+import base64
 from datetime import datetime, date
 from decimal import Decimal, ROUND_HALF_UP
 from boto3.dynamodb.conditions import Key, Attr
@@ -593,8 +594,8 @@ Rules:
                             "image": {
                                 "format": image_format,
                                 "source": {
-                                    "bytes": image_bytes
-                                }
+    				"bytes": 									base64.b64encode(image_bytes).decode('utf-8')
+				}
                             }
                         },
                         {
