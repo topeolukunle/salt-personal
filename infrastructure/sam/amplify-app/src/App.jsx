@@ -438,22 +438,26 @@ function AssetDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
   const { can } = useAuth();
-  const [records,      setRecords]      = useState([]);
-  const [rec,          setRec]          = useState(null);
-  const [loading,      setLoading]      = useState(true);
-  const [tab,          setTab]          = useState('overview');
-  const [error,        setError]        = useState('');
-  const [refreshing,   setRefreshing]   = useState(false);
-  const [aiReviewing,  setAiReviewing]  = useState(false);
-  const [aiSuggestions,setAiSuggestions]= useState(null);
-  const [aiError,      setAiError]      = useState('');
-  const [accepting,    setAccepting]    = useState(false);
+  const [records,       setRecords]       = useState([]);
+  const [rec,           setRec]           = useState(null);
+  const [loading,       setLoading]       = useState(true);
+  const [tab,           setTab]           = useState('overview');
+  const [error,         setError]         = useState('');
+  const [refreshing,    setRefreshing]    = useState(false);
+  const [aiReviewing,   setAiReviewing]   = useState(false);
+  const [aiSuggestions, setAiSuggestions] = useState(null);
+  const [aiError,       setAiError]       = useState('');
+  const [accepting,     setAccepting]     = useState(false);
 
   useEffect(() => {
     (async () => {
       try {
-        const [recs, recommendation] = await Promise.all([api.getAsset(id), api.getRecommendation(id).catch(() => null)]);
-        setRecords(Array.isArray(recs) ? recs : []); setRec(recommendation);
+        const [recs, recommendation] = await Promise.all([
+          api.getAsset(id),
+          api.getRecommendation(id).catch(() => null)
+        ]);
+        setRecords(Array.isArray(recs) ? recs : []);
+        setRec(recommendation);
       } catch(e) { setError(e.message); }
       finally { setLoading(false); }
     })();
@@ -484,15 +488,27 @@ function AssetDetail() {
         description: aiSuggestions.description,
       });
       setAiSuggestions(null);
-      // Reload records
       const recs = await api.getAsset(id);
       setRecords(Array.isArray(recs) ? recs : []);
     } catch(e) { setAiError(e.message); }
     finally { setAccepting(false); }
   }
 
+  function editSuggestions() {
+    sessionStorage.setItem('aiSuggestions', JSON.stringify(aiSuggestions));
+    navigate(`/assets/${id}/edit`);
+  }
+
+  function rejectSuggestions() {
+    setAiSuggestions(null);
+    setAiError('');
+    sessionStorage.setItem('aiRejected', 'true');
+    navigate(`/assets/${id}/edit`);
+  }
+
   if (loading) return <Spinner />;
   if (error)   return <Alert>{error}</Alert>;
+
   const profile    = records.find(r => r.record_type==='PROFILE')    || {};
   const financials = records.find(r => r.record_type==='FINANCIALS') || {};
   const status     = records.find(r => r.record_type==='STATUS')     || {};
@@ -516,18 +532,26 @@ function AssetDetail() {
           {can('update') && <NavLink to={`/assets/${id}/maintenance`}><button className="btn-secondary">Log Maintenance</button></NavLink>}
         </div>
       </div>
+
       <Tabs tabs={['overview','financials','location','maintenance','history']} active={tab} onChange={setTab} />
 
       {tab==='overview' && (
         <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:20 }}>
           <div>
             <Card title="Asset Information" style={{ marginBottom:16 }}>
-              <Grid><InfoRow label="Name" value={profile.name} /><InfoRow label="Category" value={profile.category} />
-                <InfoRow label="Manufacturer" value={profile.manufacturer} /><InfoRow label="Model" value={profile.model} />
-                <InfoRow label="Serial Number" value={profile.serial_number} mono /><InfoRow label="Asset Tag" value={profile.asset_tag} mono />
+              <Grid>
+                <InfoRow label="Name"          value={profile.name} />
+                <InfoRow label="Category"      value={profile.category} />
+                <InfoRow label="Manufacturer"  value={profile.manufacturer} />
+                <InfoRow label="Model"         value={profile.model} />
+                <InfoRow label="Serial Number" value={profile.serial_number} mono />
+                <InfoRow label="Asset Tag"     value={profile.asset_tag} mono />
               </Grid>
               <InfoRow label="Description" value={profile.description} />
-              <Grid><InfoRow label="Acquired" value={fmtDate(profile.acquired_date)} /><InfoRow label="In Service" value={fmtDate(profile.in_service_date)} /></Grid>
+              <Grid>
+                <InfoRow label="Acquired"   value={fmtDate(profile.acquired_date)} />
+                <InfoRow label="In Service" value={fmtDate(profile.in_service_date)} />
+              </Grid>
             </Card>
 
             {/* AI IMAGE ANALYSIS CARD */}
@@ -545,29 +569,23 @@ function AssetDetail() {
                         {profile.ai_confidence_score && ` · Confidence: ${profile.ai_confidence_score}`}
                       </div>
                     )}
-                    <button
-                      className="btn-secondary"
-                      onClick={handleAiReview}
-                      disabled={aiReviewing}>
+                    <button className="btn-secondary" onClick={handleAiReview} disabled={aiReviewing}>
                       {aiReviewing ? '🔄 Analysing image…' : '🔍 Run AI Analysis'}
                     </button>
                   </div>
                 ) : (
                   <div>
-                    <div>
-  <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:14 }}>
-    <Badge cls={aiSuggestions.confidence === 'High' ? 'badge-green' : aiSuggestions.confidence === 'Medium' ? 'badge-amber' : 'badge-red'}>
-      {aiSuggestions.confidence} Confidence
-    </Badge>
-    <span style={{ fontSize:12, color:'var(--text-lt)' }}>AI suggestions — review before accepting</span>
-  </div>
-  {aiSuggestions.confidence === 'Low' && (
-    <Alert type="info" style={{ marginBottom:12 }}>
-      AI confidence is Low — the image may be unclear or the asset unrecognisable. Review suggestions carefully or click Reject to enter details manually.
-    </Alert>
-  )}
-  <Grid>
-    <InfoRow label="Suggested Category" ...
+                    <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:14 }}>
+                      <Badge cls={aiSuggestions.confidence === 'High' ? 'badge-green' : aiSuggestions.confidence === 'Medium' ? 'badge-amber' : 'badge-red'}>
+                        {aiSuggestions.confidence} Confidence
+                      </Badge>
+                      <span style={{ fontSize:12, color:'var(--text-lt)' }}>AI suggestions — review before approving</span>
+                    </div>
+                    {aiSuggestions.confidence === 'Low' && (
+                      <Alert type="info" style={{ marginBottom:12 }}>
+                        AI confidence is Low — the image may be unclear. Review suggestions carefully or click Reject to enter details manually.
+                      </Alert>
+                    )}
                     <Grid>
                       <InfoRow label="Suggested Category"   value={aiSuggestions.category} />
                       <InfoRow label="Suggested Condition"  value={aiSuggestions.condition} />
@@ -578,25 +596,20 @@ function AssetDetail() {
                     </Grid>
                     <InfoRow label="Description" value={aiSuggestions.description} />
                     {aiSuggestions.notes && <InfoRow label="AI Notes" value={aiSuggestions.notes} />}
-                    <div style={{ display:'flex', gap:8, marginTop:16, paddingTop:12, borderTop:'1px solid var(--border)' }}>
-  <button className="btn-primary" onClick={acceptSuggestions} disabled={accepting}>
-    {accepting ? 'Saving…' : '✓ Approve'}
-  </button>
-  <button className="btn-secondary" onClick={() => navigate(`/assets/${id}/edit`)}>
-    ✎ Edit
-  </button>
-  <button className="btn-danger btn-sm" onClick={() => {
-  setAiSuggestions(null);
-  setAiError('');
-  sessionStorage.setItem('aiRejected', 'true');
-  navigate(`/assets/${id}/edit`);
-}}>
-  ✗ Reject — Enter Manually
-</button>
-  <button className="btn-secondary" onClick={handleAiReview} disabled={aiReviewing}>
-    {aiReviewing ? '…' : '↺ Re-run'}
-  </button>
-</div>
+                    <div style={{ display:'flex', gap:8, marginTop:16, paddingTop:12, borderTop:'1px solid var(--border)', flexWrap:'wrap' }}>
+                      <button className="btn-primary" onClick={acceptSuggestions} disabled={accepting}>
+                        {accepting ? 'Saving…' : '✓ Approve'}
+                      </button>
+                      <button className="btn-secondary" onClick={editSuggestions}>
+                        ✎ Edit
+                      </button>
+                      <button className="btn-danger btn-sm" onClick={rejectSuggestions}>
+                        ✗ Reject — Enter Manually
+                      </button>
+                      <button className="btn-secondary" onClick={handleAiReview} disabled={aiReviewing}>
+                        {aiReviewing ? '…' : '↺ Re-run'}
+                      </button>
+                    </div>
                   </div>
                 )}
               </Card>
@@ -680,15 +693,15 @@ function AssetDetail() {
               <div key={i} style={{ padding:'14px 0', borderBottom: i<locations.length-1 ? '1px solid var(--border)' : 'none' }}>
                 <div style={{ fontSize:12, color:'var(--text-lt)', marginBottom:8 }}>{fmtDate(loc.event_date)}</div>
                 <Grid cols={3}>
-                  <InfoRow label="Building"       value={loc.building} />
-                  <InfoRow label="Floor"          value={loc.floor} />
-                  <InfoRow label="Room"           value={loc.room} />
-                  <InfoRow label="Assigned To"    value={loc.assigned_to} />
-                  <InfoRow label="Department"     value={loc.assigned_department} />
-                  <InfoRow label="Condition"      value={loc.condition} />
-                  <InfoRow label="Last Cleaned"   value={fmtDate(loc.last_cleaning_date)} />
-                  <InfoRow label="Last Inspected" value={fmtDate(loc.last_inspection_date)} />
-                  <InfoRow label="Next Inspection"value={fmtDate(loc.next_inspection_date)} />
+                  <InfoRow label="Building"        value={loc.building} />
+                  <InfoRow label="Floor"           value={loc.floor} />
+                  <InfoRow label="Room"            value={loc.room} />
+                  <InfoRow label="Assigned To"     value={loc.assigned_to} />
+                  <InfoRow label="Department"      value={loc.assigned_department} />
+                  <InfoRow label="Condition"       value={loc.condition} />
+                  <InfoRow label="Last Cleaned"    value={fmtDate(loc.last_cleaning_date)} />
+                  <InfoRow label="Last Inspected"  value={fmtDate(loc.last_inspection_date)} />
+                  <InfoRow label="Next Inspection" value={fmtDate(loc.next_inspection_date)} />
                 </Grid>
               </div>
             ))
@@ -705,8 +718,13 @@ function AssetDetail() {
               : <div className="table-wrap"><table>
                   <thead><tr><th>Date</th><th>Type</th><th>Performed By</th><th>Cost</th><th>Next Due</th><th>Notes</th></tr></thead>
                   <tbody>{maintRecs.map((m,i) => (
-                    <tr key={i}><td>{fmtDate(m.event_date)}</td><td>{m.maintenance_type}</td><td>{m.performed_by}</td>
-                      <td>{fmtCurrency(m.maintenance_cost)}</td><td>{fmtDate(m.next_due_date)}</td><td className="text-lt">{m.notes||'—'}</td>
+                    <tr key={i}>
+                      <td>{fmtDate(m.event_date)}</td>
+                      <td>{m.maintenance_type}</td>
+                      <td>{m.performed_by}</td>
+                      <td>{fmtCurrency(m.maintenance_cost)}</td>
+                      <td>{fmtDate(m.next_due_date)}</td>
+                      <td className="text-lt">{m.notes||'—'}</td>
                     </tr>
                   ))}</tbody>
                 </table></div>
@@ -908,11 +926,14 @@ function RegisterAsset() {
 function EditAsset() {
   const { id } = useParams();
   const navigate = useNavigate();
-  const [saving,   setSaving]   = useState(false);
-  const [fetching, setFetching] = useState(true);
-  const [error,    setError]    = useState('');
-  const [tab,      setTab]      = useState('profile');
-  const [form,     setForm]     = useState({});
+  const [saving,        setSaving]        = useState(false);
+  const [fetching,      setFetching]      = useState(true);
+  const [error,         setError]         = useState('');
+  const [tab,           setTab]           = useState('profile');
+  const [form,          setForm]          = useState({});
+  const [aiPrepopulated,setAiPrepopulated]= useState(false);
+  const [aiRejected,    setAiRejected]    = useState(false);
+
   useEffect(() => {
     (async () => {
       try {
@@ -923,7 +944,7 @@ function EditAsset() {
         const s = arr.find(r=>r.record_type==='STATUS')     || {};
         const l = arr.filter(r=>r.record_type?.startsWith('LOCATION#')).sort((a,b)=>b.event_date?.localeCompare(a.event_date))[0] || {};
         const ns = v => v==='NOT-SET' ? '' : (v||'');
-        setForm({
+        const baseForm = {
           name:p.name||'', description:p.description||'', category:p.category||'IT Equipment',
           manufacturer:p.manufacturer||'', model:p.model||'', serial_number:p.serial_number||'', asset_tag:p.asset_tag||'',
           purchase_value:f.purchase_value||'', salvage_value:f.salvage_value||'', useful_life_years:f.useful_life_years||'',
@@ -935,12 +956,37 @@ function EditAsset() {
           building:l.building||'', floor:l.floor||'', room:l.room||'', condition:l.condition||'Good',
           assigned_to:ns(l.assigned_to), assigned_department:ns(l.assigned_department),
           last_cleaning_date:ns(l.last_cleaning_date), last_inspection_date:ns(l.last_inspection_date), next_inspection_date:ns(l.next_inspection_date),
-        });
+        };
+
+        // Check for AI suggestions passed from detail page
+        const aiRaw = sessionStorage.getItem('aiSuggestions');
+        if (aiRaw) {
+          const ai = JSON.parse(aiRaw);
+          sessionStorage.removeItem('aiSuggestions');
+          setAiPrepopulated(true);
+          setForm({
+            ...baseForm,
+            ...(ai.category    && { category:    ai.category }),
+            ...(ai.condition   && { condition:   ai.condition }),
+            ...(ai.description && { description: ai.description }),
+          });
+        } else {
+          setForm(baseForm);
+        }
+
+        // Check if coming from AI reject
+        const rejected = sessionStorage.getItem('aiRejected');
+        if (rejected) {
+          sessionStorage.removeItem('aiRejected');
+          setAiRejected(true);
+        }
       } catch(e) { setError(e.message); }
       finally { setFetching(false); }
     })();
   }, [id]);
+
   const set = (k,v) => setForm(p => ({ ...p, [k]:v }));
+
   async function save() {
     setSaving(true); setError('');
     try {
@@ -953,7 +999,9 @@ function EditAsset() {
     } catch(e) { setError(e.message); }
     finally { setSaving(false); }
   }
+
   if (fetching) return <Spinner />;
+
   return (
     <div style={{ maxWidth:760 }}>
       <div style={{ display:'flex', gap:12, alignItems:'center', marginBottom:24 }}>
@@ -961,18 +1009,16 @@ function EditAsset() {
         <h1>Edit Asset — <span className="mono" style={{ fontSize:'1rem', color:'var(--text-lt)' }}>{id}</span></h1>
       </div>
       {error && <Alert>{error}</Alert>}
-	{(() => {
-  const rejected = sessionStorage.getItem('aiRejected');
-  if (rejected) {
-    sessionStorage.removeItem('aiRejected');
-    return (
-      <Alert type="info" style={{ marginBottom:16 }}>
-        AI could not identify this asset from the photograph. Please enter the asset details manually.
-      </Alert>
-    );
-  }
-  return null;
-})()}
+      {aiRejected && (
+        <Alert type="info" style={{ marginBottom:16 }}>
+          AI could not identify this asset from the photograph. Please enter the asset details manually.
+        </Alert>
+      )}
+      {aiPrepopulated && (
+        <Alert type="info" style={{ marginBottom:16 }}>
+          Form pre-populated with AI suggestions. Review and adjust before saving.
+        </Alert>
+      )}
       <Tabs tabs={['profile','financial','status','location']} active={tab} onChange={setTab} />
       <div className="card">
         {tab==='profile' && <>
