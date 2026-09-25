@@ -571,16 +571,19 @@ function AssetDetail() {
                     <InfoRow label="Description" value={aiSuggestions.description} />
                     {aiSuggestions.notes && <InfoRow label="AI Notes" value={aiSuggestions.notes} />}
                     <div style={{ display:'flex', gap:8, marginTop:16, paddingTop:12, borderTop:'1px solid var(--border)' }}>
-                      <button className="btn-primary" onClick={acceptSuggestions} disabled={accepting}>
-                        {accepting ? 'Saving…' : '✓ Accept Suggestions'}
-                      </button>
-                      <button className="btn-secondary" onClick={() => { setAiSuggestions(null); setAiError(''); }}>
-                        ✗ Dismiss
-                      </button>
-                      <button className="btn-secondary" onClick={handleAiReview} disabled={aiReviewing}>
-                        {aiReviewing ? '…' : '↺ Re-run'}
-                      </button>
-                    </div>
+  <button className="btn-primary" onClick={acceptSuggestions} disabled={accepting}>
+    {accepting ? 'Saving…' : '✓ Approve'}
+  </button>
+  <button className="btn-secondary" onClick={() => navigate(`/assets/${id}/edit`)}>
+    ✎ Edit
+  </button>
+  <button className="btn-danger btn-sm" onClick={() => { setAiSuggestions(null); setAiError(''); }}>
+    ✗ Reject
+  </button>
+  <button className="btn-secondary" onClick={handleAiReview} disabled={aiReviewing}>
+    {aiReviewing ? '…' : '↺ Re-run'}
+  </button>
+</div>
                   </div>
                 )}
               </Card>
