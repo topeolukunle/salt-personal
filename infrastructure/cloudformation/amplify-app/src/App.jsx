@@ -117,6 +117,7 @@ const api = {
   addCondition:          (id,body) => req('POST',   `/assets/${id}/condition`, body),
   getRecommendation:     id        => req('GET',    `/assets/${id}/maintenance/recommendation`),
   refreshRecommendation: id        => req('POST',   `/assets/${id}/maintenance/recommendation`, {}),
+  triggerAiReview:       id        => req('POST',   `/assets/${id}/ai-review`, {}),
   getPhotoUrl:           (id,ct)   => req('POST',   `/assets/${id}/photo`, { content_type: ct }),
   search:                q         => req('GET',    `/assets/search?q=${encodeURIComponent(q)}`).then(r => r.results || r),
   getByCategory:         cat       => req('GET',    `/assets/category/${encodeURIComponent(cat)}`).then(r => r.assets || r),
@@ -437,12 +438,17 @@ function AssetDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
   const { can } = useAuth();
-  const [records,    setRecords]    = useState([]);
-  const [rec,        setRec]        = useState(null);
-  const [loading,    setLoading]    = useState(true);
-  const [tab,        setTab]        = useState('overview');
-  const [error,      setError]      = useState('');
-  const [refreshing, setRefreshing] = useState(false);
+  const [records,      setRecords]      = useState([]);
+  const [rec,          setRec]          = useState(null);
+  const [loading,      setLoading]      = useState(true);
+  const [tab,          setTab]          = useState('overview');
+  const [error,        setError]        = useState('');
+  const [refreshing,   setRefreshing]   = useState(false);
+  const [aiReviewing,  setAiReviewing]  = useState(false);
+  const [aiSuggestions,setAiSuggestions]= useState(null);
+  const [aiError,      setAiError]      = useState('');
+  const [accepting,    setAccepting]    = useState(false);
+
   useEffect(() => {
     (async () => {
       try {
@@ -452,12 +458,39 @@ function AssetDetail() {
       finally { setLoading(false); }
     })();
   }, [id]);
+
   async function refresh() {
     setRefreshing(true);
     try { setRec(await api.refreshRecommendation(id)); }
     catch(e) { setError(e.message); }
     finally { setRefreshing(false); }
   }
+
+  async function handleAiReview() {
+    setAiReviewing(true); setAiError(''); setAiSuggestions(null);
+    try {
+      const result = await api.triggerAiReview(id);
+      setAiSuggestions(result.suggestions);
+    } catch(e) { setAiError(e.message); }
+    finally { setAiReviewing(false); }
+  }
+
+  async function acceptSuggestions() {
+    setAccepting(true);
+    try {
+      await api.updateAsset(id, {
+        category:    aiSuggestions.category,
+        condition:   aiSuggestions.condition,
+        description: aiSuggestions.description,
+      });
+      setAiSuggestions(null);
+      // Reload records
+      const recs = await api.getAsset(id);
+      setRecords(Array.isArray(recs) ? recs : []);
+    } catch(e) { setAiError(e.message); }
+    finally { setAccepting(false); }
+  }
+
   if (loading) return <Spinner />;
   if (error)   return <Alert>{error}</Alert>;
   const profile    = records.find(r => r.record_type==='PROFILE')    || {};
@@ -466,6 +499,7 @@ function AssetDetail() {
   const locations  = records.filter(r => r.record_type?.startsWith('LOCATION#')).sort((a,b) => b.event_date?.localeCompare(a.event_date||'')||0);
   const location   = locations[0] || {};
   const maintRecs  = records.filter(r => r.record_type?.startsWith('MAINTENANCE#')).sort((a,b) => b.event_date?.localeCompare(a.event_date||'')||0);
+
   return (
     <div>
       <div style={{ display:'flex', gap:12, alignItems:'flex-start', marginBottom:24 }}>
@@ -483,6 +517,7 @@ function AssetDetail() {
         </div>
       </div>
       <Tabs tabs={['overview','financials','location','maintenance','history']} active={tab} onChange={setTab} />
+
       {tab==='overview' && (
         <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:20 }}>
           <div>
@@ -494,7 +529,64 @@ function AssetDetail() {
               <InfoRow label="Description" value={profile.description} />
               <Grid><InfoRow label="Acquired" value={fmtDate(profile.acquired_date)} /><InfoRow label="In Service" value={fmtDate(profile.in_service_date)} /></Grid>
             </Card>
+
+            {/* AI IMAGE ANALYSIS CARD */}
+            {can('update') && (
+              <Card title="AI Image Analysis">
+                {aiError && <Alert style={{ marginBottom:12 }}>{aiError}</Alert>}
+                {!aiSuggestions ? (
+                  <div>
+                    <p className="text-sm text-lt" style={{ marginBottom:12 }}>
+                      Upload a photo then run AI analysis to get suggested category, condition and description from Amazon Nova.
+                    </p>
+                    {profile.ai_review_status && profile.ai_review_status !== 'Pending' && (
+                      <div style={{ marginBottom:12, fontSize:12, color:'var(--text-lt)' }}>
+                        Last review status: <strong>{profile.ai_review_status}</strong>
+                        {profile.ai_confidence_score && ` · Confidence: ${profile.ai_confidence_score}`}
+                      </div>
+                    )}
+                    <button
+                      className="btn-secondary"
+                      onClick={handleAiReview}
+                      disabled={aiReviewing}>
+                      {aiReviewing ? '🔄 Analysing image…' : '🔍 Run AI Analysis'}
+                    </button>
+                  </div>
+                ) : (
+                  <div>
+                    <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:14 }}>
+                      <Badge cls={aiSuggestions.confidence === 'High' ? 'badge-green' : aiSuggestions.confidence === 'Medium' ? 'badge-amber' : 'badge-red'}>
+                        {aiSuggestions.confidence} Confidence
+                      </Badge>
+                      <span style={{ fontSize:12, color:'var(--text-lt)' }}>AI suggestions — review before accepting</span>
+                    </div>
+                    <Grid>
+                      <InfoRow label="Suggested Category"   value={aiSuggestions.category} />
+                      <InfoRow label="Suggested Condition"  value={aiSuggestions.condition} />
+                      <InfoRow label="Manufacturer"         value={aiSuggestions.manufacturer} />
+                      <InfoRow label="Model"                value={aiSuggestions.model} />
+                      <InfoRow label="Useful Life"          value={aiSuggestions.useful_life_years ? `${aiSuggestions.useful_life_years} years` : '—'} />
+                      <InfoRow label="Maintenance Category" value={aiSuggestions.maintenance_category} />
+                    </Grid>
+                    <InfoRow label="Description" value={aiSuggestions.description} />
+                    {aiSuggestions.notes && <InfoRow label="AI Notes" value={aiSuggestions.notes} />}
+                    <div style={{ display:'flex', gap:8, marginTop:16, paddingTop:12, borderTop:'1px solid var(--border)' }}>
+                      <button className="btn-primary" onClick={acceptSuggestions} disabled={accepting}>
+                        {accepting ? 'Saving…' : '✓ Accept Suggestions'}
+                      </button>
+                      <button className="btn-secondary" onClick={() => { setAiSuggestions(null); setAiError(''); }}>
+                        ✗ Dismiss
+                      </button>
+                      <button className="btn-secondary" onClick={handleAiReview} disabled={aiReviewing}>
+                        {aiReviewing ? '…' : '↺ Re-run'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </Card>
+            )}
           </div>
+
           <div>
             <Card title="Status and Location" style={{ marginBottom:16 }}>
               <Grid>
@@ -523,6 +615,7 @@ function AssetDetail() {
           </div>
         </div>
       )}
+
       {tab==='financials' && (
         <Card>
           <h3 style={{ marginBottom:12 }}>Purchase and Depreciation</h3>
@@ -563,6 +656,7 @@ function AssetDetail() {
           </Grid>
         </Card>
       )}
+
       {tab==='location' && (
         <Card title="Location History">
           {locations.length===0 ? <p className="text-lt">No location records.</p>
@@ -585,6 +679,7 @@ function AssetDetail() {
           }
         </Card>
       )}
+
       {tab==='maintenance' && (
         <div>
           {can('update') && <div style={{ marginBottom:16 }}><NavLink to={`/assets/${id}/maintenance`}><button className="btn-primary">+ Log Maintenance</button></NavLink></div>}
@@ -603,6 +698,7 @@ function AssetDetail() {
           </Card>
         </div>
       )}
+
       {tab==='history' && (
         <Card title="Full Asset Timeline">
           <div className="table-wrap"><table>
@@ -744,7 +840,7 @@ function RegisterAsset() {
         </>}
         {step===4 && <>
           <h3 style={{ marginBottom:8 }}>Asset Photograph</h3>
-          <p className="text-lt text-sm" style={{ marginBottom:16 }}>Stored securely in a private S3 bucket. AI analysis will be added in a future update.</p>
+          <p className="text-lt text-sm" style={{ marginBottom:16 }}>Stored securely in a private S3 bucket. AI analysis available after upload.</p>
           {photoPreview
             ? <div><img src={photoPreview} alt="Preview" style={{ maxWidth:'100%', maxHeight:280, borderRadius:'var(--radius)', border:'1px solid var(--border)', objectFit:'cover' }} />
                 <button className="btn-secondary btn-sm" style={{ marginTop:8 }} onClick={() => { setPhotoFile(null); setPhotoPreview(null); }}>Remove</button></div>
