@@ -554,12 +554,20 @@ function AssetDetail() {
                   </div>
                 ) : (
                   <div>
-                    <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:14 }}>
-                      <Badge cls={aiSuggestions.confidence === 'High' ? 'badge-green' : aiSuggestions.confidence === 'Medium' ? 'badge-amber' : 'badge-red'}>
-                        {aiSuggestions.confidence} Confidence
-                      </Badge>
-                      <span style={{ fontSize:12, color:'var(--text-lt)' }}>AI suggestions — review before accepting</span>
-                    </div>
+                    <div>
+  <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:14 }}>
+    <Badge cls={aiSuggestions.confidence === 'High' ? 'badge-green' : aiSuggestions.confidence === 'Medium' ? 'badge-amber' : 'badge-red'}>
+      {aiSuggestions.confidence} Confidence
+    </Badge>
+    <span style={{ fontSize:12, color:'var(--text-lt)' }}>AI suggestions — review before accepting</span>
+  </div>
+  {aiSuggestions.confidence === 'Low' && (
+    <Alert type="info" style={{ marginBottom:12 }}>
+      AI confidence is Low — the image may be unclear or the asset unrecognisable. Review suggestions carefully or click Reject to enter details manually.
+    </Alert>
+  )}
+  <Grid>
+    <InfoRow label="Suggested Category" ...
                     <Grid>
                       <InfoRow label="Suggested Category"   value={aiSuggestions.category} />
                       <InfoRow label="Suggested Condition"  value={aiSuggestions.condition} />
@@ -577,9 +585,14 @@ function AssetDetail() {
   <button className="btn-secondary" onClick={() => navigate(`/assets/${id}/edit`)}>
     ✎ Edit
   </button>
-  <button className="btn-danger btn-sm" onClick={() => { setAiSuggestions(null); setAiError(''); }}>
-    ✗ Reject
-  </button>
+  <button className="btn-danger btn-sm" onClick={() => {
+  setAiSuggestions(null);
+  setAiError('');
+  sessionStorage.setItem('aiRejected', 'true');
+  navigate(`/assets/${id}/edit`);
+}}>
+  ✗ Reject — Enter Manually
+</button>
   <button className="btn-secondary" onClick={handleAiReview} disabled={aiReviewing}>
     {aiReviewing ? '…' : '↺ Re-run'}
   </button>
@@ -948,6 +961,18 @@ function EditAsset() {
         <h1>Edit Asset — <span className="mono" style={{ fontSize:'1rem', color:'var(--text-lt)' }}>{id}</span></h1>
       </div>
       {error && <Alert>{error}</Alert>}
+	{(() => {
+  const rejected = sessionStorage.getItem('aiRejected');
+  if (rejected) {
+    sessionStorage.removeItem('aiRejected');
+    return (
+      <Alert type="info" style={{ marginBottom:16 }}>
+        AI could not identify this asset from the photograph. Please enter the asset details manually.
+      </Alert>
+    );
+  }
+  return null;
+})()}
       <Tabs tabs={['profile','financial','status','location']} active={tab} onChange={setTab} />
       <div className="card">
         {tab==='profile' && <>
