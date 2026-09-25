@@ -617,7 +617,7 @@ Rules:
         )
 
         bedrock_response = bedrock.invoke_model(
-            modelId='amazon.nova-2-lite-v1:0',
+    	    modelId='us.amazon.nova-2-lite-v1:0',
             body=json.dumps(request_body),
             contentType='application/json',
             accept='application/json'
