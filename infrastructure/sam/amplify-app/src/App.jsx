@@ -1,10 +1,11 @@
 // ============================================================
 // SALT — Smart Asset Lifecycle Tracker
-// Updated: #3 AI schema, #18 maintenance history tab,
-//          #24 manual entry fallback, #25 photo upload retry
+// Photo-first registration flow: upload photo → AI populates fields
+// → user reviews/edits → saves asset
+// Currency: USD ($)
 // ============================================================
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Routes, Route, Navigate, NavLink, useNavigate, useParams } from 'react-router-dom';
 import { Amplify } from 'aws-amplify';
 import { Authenticator } from '@aws-amplify/ui-react';
@@ -52,9 +53,16 @@ const PERMISSIONS = {
   Employee:      ['read'],
 };
 
-function fmt(val, dec=2) { const n=parseFloat(val); return isNaN(n)?'—':n.toLocaleString('en-GB',{minimumFractionDigits:dec,maximumFractionDigits:dec}); }
-function fmtCurrency(val) { const n=parseFloat(val); return isNaN(n)?'—':'£'+n.toLocaleString('en-GB',{minimumFractionDigits:2,maximumFractionDigits:2}); }
-function fmtDate(val) { if(!val||val==='NOT-SET'||val==='TBD') return '—'; try { return new Date(val).toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'}); } catch { return val; } }
+// USD currency formatter
+function fmtCurrency(val) {
+  const n = parseFloat(val);
+  return isNaN(n) ? '—' : '$' + n.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+}
+function fmtDate(val) {
+  if (!val || val === 'NOT-SET' || val === 'TBD') return '—';
+  try { return new Date(val).toLocaleDateString('en-US', {day:'numeric', month:'short', year:'numeric'}); }
+  catch { return val; }
+}
 function statusBadge(s) { return {Available:'badge-green',Assigned:'badge-blue','Checked Out':'badge-amber','In Maintenance':'badge-purple',Damaged:'badge-red',Lost:'badge-red',Stolen:'badge-red',Retired:'badge-gray'}[s]||'badge-gray'; }
 function conditionBadge(c) { return {Excellent:'badge-green',Good:'badge-green',Fair:'badge-amber',Poor:'badge-red',Critical:'badge-red'}[c]||'badge-gray'; }
 function priorityBadge(p) { return {Critical:'badge-red',High:'badge-amber',Medium:'badge-blue',Low:'badge-green'}[p]||'badge-gray'; }
@@ -79,7 +87,6 @@ const api = {
   getHistory:            id        => req('GET',    `/assets/${id}/history`).then(r=>r.history||r),
   addMaintenance:        (id,body) => req('POST',   `/assets/${id}/maintenance`, body),
   getMaintenanceHistory: id        => req('GET',    `/assets/${id}/maintenance`).then(r=>r.maintenance_history||r),
-  addCondition:          (id,body) => req('POST',   `/assets/${id}/condition`, body),
   getRecommendation:     id        => req('GET',    `/assets/${id}/maintenance/recommendation`),
   refreshRecommendation: id        => req('POST',   `/assets/${id}/maintenance/recommendation`, {}),
   approveRecommendation: (id,body) => req('POST',   `/assets/${id}/maintenance/recommendation/approve`, body),
@@ -92,27 +99,44 @@ const api = {
   getReports:            ()        => req('GET',    '/reports'),
 };
 
-// #25 Photo upload with retry — does not lose form data on failure
-async function uploadPhoto(assetId, file, retries=2) {
+// Upload photo with retry — returns {presigned_url, key, content_type}
+async function getPresignedUrl(assetId, fileType, retries=2) {
   let lastError;
   for (let attempt=0; attempt<=retries; attempt++) {
-    try {
-      const { presigned_url, key, content_type } = await api.getPhotoUrl(assetId, file.type||'image/jpeg');
-      const uploadRes = await fetch(presigned_url, {
-        method:  'PUT',
-        body:    file,
-        headers: { 'Content-Type': content_type||file.type||'image/jpeg' },
-      });
-      if (!uploadRes.ok) throw new Error(`S3 upload failed: ${uploadRes.status}`);
-      return key;
-    } catch(e) {
+    try { return await api.getPhotoUrl(assetId, fileType); }
+    catch(e) {
       lastError = e;
-      if (attempt < retries) {
-        await new Promise(r => setTimeout(r, 1000 * (attempt+1)));
-      }
+      if (attempt < retries) await new Promise(r=>setTimeout(r, 1000*(attempt+1)));
     }
   }
   throw lastError;
+}
+
+async function putFileToS3(presignedUrl, file, contentType, retries=2) {
+  let lastError;
+  for (let attempt=0; attempt<=retries; attempt++) {
+    try {
+      const res = await fetch(presignedUrl, {
+        method:  'PUT',
+        body:    file,
+        headers: { 'Content-Type': contentType },
+      });
+      if (!res.ok) throw new Error(`S3 upload failed with status ${res.status}`);
+      return true;
+    } catch(e) {
+      lastError = e;
+      if (attempt < retries) await new Promise(r=>setTimeout(r, 1000*(attempt+1)));
+    }
+  }
+  throw lastError;
+}
+
+async function uploadPhotoToAsset(assetId, file) {
+  const fileType    = file.type || 'image/jpeg';
+  const urlData     = await getPresignedUrl(assetId, fileType);
+  const contentType = urlData.content_type || fileType;
+  await putFileToS3(urlData.presigned_url, file, contentType);
+  return urlData.key;
 }
 
 function useAuth() {
@@ -134,7 +158,15 @@ function useAuth() {
 function Spinner() { return <div style={{display:'flex',justifyContent:'center',padding:60}}><div className="spinner"/></div>; }
 function Alert({type='error',children,style}) { return <div className={`alert alert-${type}`} style={style}>{children}</div>; }
 function Badge({cls,children}) { return <span className={`badge ${cls}`}>{children}</span>; }
-function Field({label,required,children}) { return <div className="form-group"><label className="form-label">{label}{required&&<span style={{color:'var(--red)'}}> *</span>}</label>{children}</div>; }
+function Field({label,required,error,children}) {
+  return (
+    <div className="form-group">
+      <label className="form-label">{label}{required&&<span style={{color:'var(--red)'}}> *</span>}</label>
+      {children}
+      {error&&<div style={{color:'var(--red)',fontSize:12,marginTop:4}}>{error}</div>}
+    </div>
+  );
+}
 function Card({title,action,children,style}) { return <div className="card" style={style}>{title&&<div className="card-header"><h2 className="mb-0">{title}</h2>{action}</div>}{children}</div>; }
 function StatCard({label,value,sub}) { return <div className="stat-card"><div className="stat-label">{label}</div><div className="stat-value">{value}</div>{sub&&<div className="stat-sub">{sub}</div>}</div>; }
 function InfoRow({label,value,mono}) { return <div style={{marginBottom:10}}><div className="text-sm text-lt" style={{marginBottom:2}}>{label}</div><div className={mono?'mono':''} style={{fontWeight:500}}>{value||'—'}</div></div>; }
@@ -244,13 +276,10 @@ function AssetDetail() {
   const [aiReviewing,setAiReviewing]=useState(false); const [aiSuggestions,setAiSuggestions]=useState(null);
   const [aiError,setAiError]=useState(''); const [accepting,setAccepting]=useState(false);
   const [approving,setApproving]=useState(false);
-  // #18 Maintenance history state
   const [maintHistory,setMaintHistory]=useState([]); const [maintLoading,setMaintLoading]=useState(false);
   const [maintError,setMaintError]=useState('');
 
   useEffect(()=>{(async()=>{try{const[recs,recommendation]=await Promise.all([api.getAsset(id),api.getRecommendation(id).catch(()=>null)]);setRecords(Array.isArray(recs)?recs:[]);setRec(recommendation);}catch(e){setError(e.message);}finally{setLoading(false);}})();},[id]);
-
-  // #18 Load maintenance history when tab selected
   useEffect(()=>{if(tab==='maintenance'&&maintHistory.length===0){(async()=>{setMaintLoading(true);setMaintError('');try{const h=await api.getMaintenanceHistory(id);setMaintHistory(Array.isArray(h)?h:[]);}catch(e){setMaintError(e.message);}finally{setMaintLoading(false);}})();}},[ tab,id]);
 
   async function refresh(){setRefreshing(true);try{setRec(await api.refreshRecommendation(id));}catch(e){setError(e.message);}finally{setRefreshing(false);}}
@@ -259,9 +288,8 @@ function AssetDetail() {
     setAiReviewing(true);setAiError('');setAiSuggestions(null);
     try{
       const result=await api.triggerAiReview(id);
-      // #3 Handle manual_entry_required from updated schema
       if(result.manual_entry_required||result.identification_status==='manual_entry_required'){
-        setAiError(result.message||'We could not identify this asset from the photograph. Please enter the required details manually, or upload a clearer image.');
+        setAiError(result.message||'Could not identify asset from photograph. Please enter details manually.');
       } else {
         setAiSuggestions(result.suggestions);
       }
@@ -317,7 +345,6 @@ function AssetDetail() {
         </div>
       </div>
 
-      {/* #18 Added maintenance tab */}
       <Tabs tabs={['overview','financials','location','maintenance','history']} active={tab} onChange={setTab}/>
 
       {tab==='overview'&&(
@@ -331,38 +358,40 @@ function AssetDetail() {
 
             {can('update')&&(
               <Card title="AI Image Analysis">
-                {aiError&&<Alert type="info" style={{marginBottom:12}}>{aiError}<br/><button className="btn-secondary btn-sm" style={{marginTop:8}} onClick={()=>navigate(`/assets/${id}/edit`)}>Enter Details Manually</button></Alert>}
+                {aiError&&(
+                  <Alert type="info" style={{marginBottom:12}}>
+                    {aiError}
+                    <div style={{marginTop:8}}>
+                      <button className="btn-secondary btn-sm" onClick={()=>navigate(`/assets/${id}/edit`)}>Enter Details Manually</button>
+                    </div>
+                  </Alert>
+                )}
                 {!aiSuggestions?(
                   <div>
-                    <p className="text-sm text-lt" style={{marginBottom:12}}>Upload a photo then run AI analysis to get suggested category, condition and description from Amazon Nova.</p>
+                    <p className="text-sm text-lt" style={{marginBottom:12}}>Run AI analysis on the uploaded photo to get suggested category, condition and description.</p>
                     {profile.ai_review_status&&profile.ai_review_status!=='Pending'&&(
                       <div style={{marginBottom:12,fontSize:12,color:'var(--text-lt)'}}>Last review: <strong>{profile.ai_review_status}</strong></div>
                     )}
-                    <button className="btn-secondary" onClick={handleAiReview} disabled={aiReviewing}>{aiReviewing?'🔄 Analysing image…':'🔍 Run AI Analysis'}</button>
+                    <button className="btn-secondary" onClick={handleAiReview} disabled={aiReviewing}>{aiReviewing?'🔄 Analysing…':'🔍 Run AI Analysis'}</button>
                   </div>
                 ):(
                   <div>
                     <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:14}}>
-                      {/* #3 Use identificationStatus from updated schema */}
                       <Badge cls={aiSuggestions.identificationStatus==='suggestion_available'?'badge-green':'badge-amber'}>
                         {aiSuggestions.identificationStatus==='suggestion_available'?'Identified':'Review Needed'}
                       </Badge>
-                      <span style={{fontSize:12,color:'var(--text-lt)'}}>AI suggestions — review before approving</span>
+                      <span style={{fontSize:12,color:'var(--text-lt)'}}>Review before approving</span>
                     </div>
-                    {/* #3 Show visibleConditionNotes */}
-                    {aiSuggestions.visibleConditionNotes&&(
-                      <Alert type="info" style={{marginBottom:12}}>{aiSuggestions.visibleConditionNotes}</Alert>
-                    )}
+                    {aiSuggestions.visibleConditionNotes&&<Alert type="info" style={{marginBottom:12}}>{aiSuggestions.visibleConditionNotes}</Alert>}
                     <Grid>
                       <InfoRow label="Suggested Category"  value={aiSuggestions.category}/>
                       <InfoRow label="Suggested Condition" value={aiSuggestions.condition}/>
                       <InfoRow label="Manufacturer"        value={aiSuggestions.manufacturer}/>
                       <InfoRow label="Model"               value={aiSuggestions.model}/>
-                      <InfoRow label="Useful Life"         value={aiSuggestions.useful_life_months?`${Math.round(aiSuggestions.useful_life_months/12)} years (${aiSuggestions.useful_life_months} months)`:'—'}/>
+                      <InfoRow label="Useful Life"         value={aiSuggestions.useful_life_months?`${aiSuggestions.useful_life_months} months`:'-'}/>
                     </Grid>
                     <InfoRow label="Description" value={aiSuggestions.description}/>
-                    {/* #3 Show reviewNotes array */}
-                    {aiSuggestions.reviewNotes&&aiSuggestions.reviewNotes.length>0&&(
+                    {aiSuggestions.reviewNotes?.length>0&&(
                       <div style={{marginTop:8,marginBottom:8}}>
                         <div className="text-sm text-lt" style={{marginBottom:4}}>AI Notes</div>
                         {aiSuggestions.reviewNotes.map((note,i)=><div key={i} style={{fontSize:13,color:'var(--text-lt)',marginBottom:2}}>• {note}</div>)}
@@ -400,10 +429,9 @@ function AssetDetail() {
                 <p style={{fontSize:13,marginBottom:12}}>{rec.recommended_action||rec.recommendedAction}</p>
                 {rec.reason&&<p style={{fontSize:12,color:'var(--text-lt)',marginBottom:12}}>{rec.reason}</p>}
                 <Grid>
-                  <InfoRow label="Interval"         value={rec.suggested_interval_days?`${rec.suggested_interval_days} days`:rec.suggested_maintenance_interval}/>
-                  <InfoRow label="Next Due"          value={fmtDate(rec.next_maintenance_due||rec.recommended_completion_date)}/>
-                  <InfoRow label="Replacement"       value={rec.replacement_recommendation||rec.expected_replacement_window}/>
-                  <InfoRow label="Requires Approval" value={rec.requires_approval?'Yes':'No'}/>
+                  <InfoRow label="Interval"   value={rec.suggested_interval_days?`${rec.suggested_interval_days} days`:rec.suggested_maintenance_interval}/>
+                  <InfoRow label="Next Due"   value={fmtDate(rec.next_maintenance_due||rec.recommended_completion_date)}/>
+                  <InfoRow label="Replacement" value={rec.replacement_recommendation||rec.expected_replacement_window}/>
                 </Grid>
                 {rec.limitations&&(
                   <div style={{marginTop:8}}>
@@ -413,7 +441,6 @@ function AssetDetail() {
                     ))}
                   </div>
                 )}
-                {/* #13 Approve recommendation button */}
                 {can('update')&&rec.approval_status!=='Approved'&&(
                   <button className="btn-primary btn-sm" style={{marginTop:12}} onClick={handleApproveRecommendation} disabled={approving}>
                     {approving?'Approving…':'✓ Approve Recommendation'}
@@ -432,13 +459,12 @@ function AssetDetail() {
         <Card>
           <h3 style={{marginBottom:12}}>Purchase and Depreciation</h3>
           <Grid cols={3}>
-            <InfoRow label="Purchase Value"  value={fmtCurrency(financials.purchase_value)}/>
-            <InfoRow label="Salvage Value"   value={fmtCurrency(financials.salvage_value)}/>
-            {/* #1 Show both months and years */}
-            <InfoRow label="Useful Life"     value={financials.useful_life_months?`${financials.useful_life_months} months (${(financials.useful_life_months/12).toFixed(1)} years)`:financials.useful_life_years?`${financials.useful_life_years} years`:'—'}/>
+            <InfoRow label="Purchase Value" value={fmtCurrency(financials.purchase_value)}/>
+            <InfoRow label="Salvage Value"  value={fmtCurrency(financials.salvage_value)}/>
+            <InfoRow label="Useful Life"    value={financials.useful_life_months?`${financials.useful_life_months} months (${(financials.useful_life_months/12).toFixed(1)} yrs)`:financials.useful_life_years?`${financials.useful_life_years} years`:'—'}/>
           </Grid>
           <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:12,margin:'16px 0'}}>
-            {[['Annual Depreciation',fmtCurrency(financials.annual_depreciation)],['Accumulated Depreciation',fmtCurrency(financials.accumulated_depreciation)],['Current Book Value',fmtCurrency(financials.current_book_value)]].map(([label,val])=>(
+            {[['Annual Depreciation',fmtCurrency(financials.annual_depreciation)],['Accumulated',fmtCurrency(financials.accumulated_depreciation)],['Current Book Value',fmtCurrency(financials.current_book_value)]].map(([label,val])=>(
               <div key={label} style={{padding:'14px 16px',background:'var(--surface)',borderRadius:'var(--radius)',border:'1px solid var(--border)'}}>
                 <div className="stat-label">{label}</div>
                 <div style={{fontSize:'1.2rem',fontWeight:700,color:'var(--navy)'}}>{val}</div>
@@ -457,7 +483,6 @@ function AssetDetail() {
             </div>
           )}
           <Grid cols={3}>
-            {/* #2 Show in_service_date as depreciation start */}
             <InfoRow label="In Service (Depreciation Start)" value={fmtDate(financials.in_service_date)}/>
             <InfoRow label="Estimated Replacement"           value={fmtDate(financials.estimated_replacement_date||financials.estimated_replacement)}/>
             <InfoRow label="Last Calculated"                 value={fmtDate(financials.last_calculated_date)}/>
@@ -480,14 +505,13 @@ function AssetDetail() {
         </Card>
       )}
 
-      {/* #18 Maintenance history tab */}
       {tab==='maintenance'&&(
         <div>
           {can('update')&&<div style={{marginBottom:16}}><NavLink to={`/assets/${id}/maintenance`}><button className="btn-primary">+ Log Maintenance</button></NavLink></div>}
           {maintError&&<Alert>{maintError}</Alert>}
           {maintLoading?<Spinner/>:(
             <Card title="Maintenance History">
-              {maintHistory.length===0?<div className="empty-state"><h3>No maintenance records</h3><p>Log the first maintenance event for this asset.</p></div>:
+              {maintHistory.length===0?<div className="empty-state"><h3>No maintenance records</h3></div>:
               <div className="table-wrap"><table>
                 <thead><tr><th>ID</th><th>Date</th><th>Type</th><th>Performed By</th><th>Cost</th><th>Condition After</th><th>Next Due</th><th>Notes</th></tr></thead>
                 <tbody>{maintHistory.map((m,i)=>(
@@ -530,86 +554,169 @@ function AssetDetail() {
   );
 }
 
+// ============================================================
+// REGISTER ASSET — Photo-first flow
+// Step 1: Upload photo (optional) → AI auto-populates fields
+// Step 2: Review/edit Details (pre-filled by AI or manual)
+// Step 3: Financial information
+// Step 4: Location information
+// Step 5: Review and confirm
+// ============================================================
 function RegisterAsset() {
-  const navigate=useNavigate();
-  const [step,setStep]=useState(1); const [saving,setSaving]=useState(false);
-  const [error,setError]=useState(''); const [fieldErrors,setFieldErrors]=useState({});
-  const [photoFile,setPhotoFile]=useState(null); const [photoPreview,setPhotoPreview]=useState(null);
-  const [photoError,setPhotoError]=useState(''); // #25 photo error state
-  const [form,setForm]=useState({
-    name:'',category:'IT Equipment',manufacturer:'',model:'',serial_number:'',asset_tag:'',description:'',
-    acquired_date:'',in_service_date:'',purchase_value:'',purchase_date:'',salvage_value:'',
-    useful_life_months:'',depreciation_method:'straight-line',warranty_expiration:'',
-    status:'Available',usage_level:'Daily',environment:'Indoor',condition:'Good',
-    building:'',floor:'',room:'',assigned_to:'',assigned_department:'',
-  });
-  const set=(k,v)=>setForm(p=>({...p,[k]:v}));
+  const navigate  = useNavigate();
+  const fileRef   = useRef(null);
+  const [step,    setStep]    = useState(1);
+  const [saving,  setSaving]  = useState(false);
+  const [error,   setError]   = useState('');
+  const [fieldErrors,setFieldErrors] = useState({});
 
-  function handlePhoto(e){
-    const file=e.target.files?.[0]; if(!file) return;
+  // Photo state
+  const [photoFile,      setPhotoFile]      = useState(null);
+  const [photoPreview,   setPhotoPreview]   = useState(null);
+  const [photoError,     setPhotoError]     = useState('');
+  const [analyzing,      setAnalyzing]      = useState(false);
+  const [aiDone,         setAiDone]         = useState(false);
+  const [aiStatus,       setAiStatus]       = useState(''); // 'success' | 'manual' | 'skipped'
+  const [tempAssetId,    setTempAssetId]    = useState(null); // created on photo upload
+
+  const [form, setForm] = useState({
+    name:'', category:'IT Equipment', manufacturer:'', model:'',
+    serial_number:'', asset_tag:'', description:'',
+    acquired_date:'', in_service_date:'',
+    purchase_value:'', purchase_date:'', salvage_value:'',
+    useful_life_months:'', warranty_expiration:'',
+    status:'Available', condition:'Good', usage_level:'Daily', environment:'Indoor',
+    building:'', floor:'', room:'', assigned_to:'', assigned_department:'',
+  });
+  const set = (k,v) => setForm(p=>({...p,[k]:v}));
+
+  // ── Step 1: Photo upload and AI analysis ──────────────────
+  function handlePhotoSelect(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
     setPhotoFile(file); setPhotoError('');
-    const r=new FileReader(); r.onload=ev=>setPhotoPreview(ev.target.result); r.readAsDataURL(file);
+    const r = new FileReader(); r.onload = ev => setPhotoPreview(ev.target.result); r.readAsDataURL(file);
   }
 
-  function validate(){
-    const errs={};
-    if(!form.name.trim()) errs.name='Asset name is required';
-    if(!form.acquired_date) errs.acquired_date='Acquisition date is required';
-    if(!form.in_service_date) errs.in_service_date='In-service date is required';
-    if(!form.purchase_date) errs.purchase_date='Purchase date is required';
-    const pv=parseFloat(form.purchase_value),sv=parseFloat(form.salvage_value),ul=parseFloat(form.useful_life_months);
-    if(isNaN(pv)||pv<0) errs.purchase_value='Purchase value must be a positive number';
-    if(isNaN(sv)||sv<0) errs.salvage_value='Salvage value must be a positive number';
-    if(!isNaN(pv)&&!isNaN(sv)&&sv>pv) errs.salvage_value='Salvage value cannot exceed purchase value';
-    if(isNaN(ul)||ul<=0) errs.useful_life_months='Useful life must be greater than zero (months)';
+  async function handleAnalyze() {
+    if (!photoFile) { setStep(2); setAiStatus('skipped'); return; }
+    setAnalyzing(true); setPhotoError('');
+    try {
+      // Create a temporary asset record to get an ID for photo upload
+      const tempResult = await api.createAsset({
+        name:          'PENDING',
+        acquired_date: new Date().toISOString().slice(0,10),
+        in_service_date: new Date().toISOString().slice(0,10),
+        status:        'Available',
+        category:      'Other',
+      });
+      const tId = tempResult.asset_id;
+      setTempAssetId(tId);
+
+      // Upload photo to S3
+      const key = await uploadPhotoToAsset(tId, photoFile);
+      await api.updateAsset(tId, {image_key: key});
+
+      // Trigger AI analysis
+      const aiResult = await api.triggerAiReview(tId);
+
+      if (aiResult.manual_entry_required || aiResult.identification_status === 'manual_entry_required') {
+        setAiStatus('manual');
+        setAiDone(true);
+        setStep(2);
+        return;
+      }
+
+      // Pre-populate form with AI suggestions
+      const s = aiResult.suggestions || {};
+      setForm(p => ({
+        ...p,
+        category:            s.category    || p.category,
+        manufacturer:        s.manufacturer|| p.manufacturer,
+        model:               s.model       || p.model,
+        description:         s.description || p.description,
+        condition:           s.condition   || p.condition,
+        useful_life_months:  s.useful_life_months ? String(s.useful_life_months) : p.useful_life_months,
+      }));
+      setAiStatus('success');
+      setAiDone(true);
+      setStep(2);
+    } catch(e) {
+      setPhotoError(`Photo upload or AI analysis failed: ${e.message}. You can continue without AI suggestions.`);
+      setAiStatus('manual');
+      setAiDone(true);
+      setStep(2);
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  function skipPhoto() { setAiStatus('skipped'); setStep(2); }
+
+  // ── Validation ────────────────────────────────────────────
+  function validate() {
+    const errs = {};
+    if (!form.name.trim())      errs.name           = 'Asset name is required';
+    if (!form.acquired_date)    errs.acquired_date   = 'Acquisition date is required';
+    if (!form.in_service_date)  errs.in_service_date = 'In-service date is required';
+    if (!form.purchase_date)    errs.purchase_date   = 'Purchase date is required';
+    const pv = parseFloat(form.purchase_value);
+    const sv = parseFloat(form.salvage_value);
+    const ul = parseInt(form.useful_life_months);
+    if (isNaN(pv)||pv<0)        errs.purchase_value    = 'Purchase value must be a positive number';
+    if (isNaN(sv)||sv<0)        errs.salvage_value     = 'Salvage value must be a positive number';
+    if (!isNaN(pv)&&!isNaN(sv)&&sv>pv) errs.salvage_value = 'Salvage value cannot exceed purchase value';
+    if (isNaN(ul)||ul<=0)       errs.useful_life_months = 'Useful life must be greater than zero';
     return errs;
   }
 
-  async function handleSubmit(){
-    const errs=validate();
-    if(Object.keys(errs).length){setFieldErrors(errs);return;}
-    setSaving(true);setError('');setFieldErrors({});
-    try{
-      const result=await api.createAsset({
+  // ── Final save ────────────────────────────────────────────
+  async function handleSubmit() {
+    const errs = validate();
+    if (Object.keys(errs).length) { setFieldErrors(errs); return; }
+    setSaving(true); setError(''); setFieldErrors({});
+    try {
+      const payload = {
         ...form,
-        purchase_value:   parseFloat(form.purchase_value),
-        salvage_value:    parseFloat(form.salvage_value),
+        purchase_value:     parseFloat(form.purchase_value),
+        salvage_value:      parseFloat(form.salvage_value),
         useful_life_months: parseInt(form.useful_life_months),
-        useful_life_years: parseFloat(form.useful_life_months)/12,
-      });
-      const newId=result.asset_id;
-      if(photoFile&&newId){
-        try{
-          // #25 Upload with retry
-          const key=await uploadPhoto(newId,photoFile);
-          await api.updateAsset(newId,{image_key:key});
-        }catch(photoErr){
-          // #25 Photo failed but asset was created — do not lose the asset
-          setPhotoError(`Asset created but photo upload failed: ${photoErr.message}. You can upload the photo from the asset detail page.`);
-          navigate(`/assets/${newId}`);
-          return;
+      };
+
+      let finalId = tempAssetId;
+
+      if (tempAssetId) {
+        // Update the temporary asset created during photo upload
+        await api.updateAsset(tempAssetId, {...payload, record_type: 'PROFILE'});
+        if (payload.purchase_value) {
+          await api.updateAsset(tempAssetId, {...payload, record_type: 'FINANCIALS'});
         }
+        await api.updateAsset(tempAssetId, {...payload, record_type: 'STATUS'});
+      } else {
+        // No photo — create fresh
+        const result = await api.createAsset(payload);
+        finalId = result.asset_id;
       }
-      navigate(`/assets/${newId}`);
-    }catch(e){
-      // #9 Show field-level errors if returned
-      if(e.message&&e.message.includes('ValidationError')){
-        try{const parsed=JSON.parse(e.message);setFieldErrors(parsed.details||{});}catch{}
-      }
+
+      navigate(`/assets/${finalId}`);
+    } catch(e) {
       setError(e.message);
       setSaving(false);
     }
   }
 
-  const steps=['Details','Financial','Location','Photo','Confirm'];
-  const estMonthly=form.purchase_value&&form.salvage_value&&form.useful_life_months
-    ?(((parseFloat(form.purchase_value)||0)-(parseFloat(form.salvage_value)||0))/(parseFloat(form.useful_life_months)||1)).toFixed(2):null;
-  const estAnnual=estMonthly?(parseFloat(estMonthly)*12).toFixed(2):null;
+  const estMonthly = form.purchase_value && form.salvage_value && form.useful_life_months
+    ? (((parseFloat(form.purchase_value)||0)-(parseFloat(form.salvage_value)||0))/(parseInt(form.useful_life_months)||1)).toFixed(2) : null;
+  const estAnnual  = estMonthly ? (parseFloat(estMonthly)*12).toFixed(2) : null;
+
+  const steps = ['Photo & AI','Details','Financial','Location','Confirm'];
 
   return (
-    <div style={{maxWidth:760}}>
+    <div style={{maxWidth:780}}>
       <h1 style={{marginBottom:4}}>Register New Asset</h1>
-      <p className="text-lt text-sm" style={{marginBottom:24}}>Complete all sections. Depreciation is calculated automatically on save.</p>
+      <p className="text-lt text-sm" style={{marginBottom:24}}>Start by uploading a photo — AI will suggest asset details automatically.</p>
+
+      {/* Step indicator */}
       <div style={{display:'flex',gap:0,marginBottom:28}}>
         {steps.map((s,i)=>(
           <React.Fragment key={s}>
@@ -621,88 +728,170 @@ function RegisterAsset() {
           </React.Fragment>
         ))}
       </div>
-      {error&&<Alert style={{marginBottom:16}}>{error}</Alert>}
-      {photoError&&<Alert type="info" style={{marginBottom:16}}>{photoError}</Alert>}
+
+      {error && <Alert style={{marginBottom:16}}>{error}</Alert>}
+
       <div className="card">
-        {step===1&&<>
-          <div className="form-row">
-            <Field label="Asset Name" required><input value={form.name} onChange={e=>set('name',e.target.value)}/>{fieldErrors.name&&<div style={{color:'var(--red)',fontSize:12,marginTop:4}}>{fieldErrors.name}</div>}</Field>
-            <Field label="Category"><select value={form.category} onChange={e=>set('category',e.target.value)}>{CATEGORIES.map(c=><option key={c}>{c}</option>)}</select></Field>
-          </div>
-          <div className="form-row"><Field label="Manufacturer"><input value={form.manufacturer} onChange={e=>set('manufacturer',e.target.value)}/></Field><Field label="Model"><input value={form.model} onChange={e=>set('model',e.target.value)}/></Field></div>
-          <div className="form-row"><Field label="Serial Number"><input value={form.serial_number} onChange={e=>set('serial_number',e.target.value)}/></Field><Field label="Asset Tag"><input value={form.asset_tag} onChange={e=>set('asset_tag',e.target.value)}/></Field></div>
-          <Field label="Description"><textarea value={form.description} onChange={e=>set('description',e.target.value)} rows={2}/></Field>
-          <div className="form-row">
-            <Field label="Status"><select value={form.status} onChange={e=>set('status',e.target.value)}>{STATUSES.map(s=><option key={s}>{s}</option>)}</select></Field>
-            <Field label="Condition"><select value={form.condition} onChange={e=>set('condition',e.target.value)}>{CONDITIONS.map(c=><option key={c}>{c}</option>)}</select></Field>
-          </div>
-          <div className="form-row">
-            <Field label="Acquisition Date" required><input type="date" value={form.acquired_date} onChange={e=>set('acquired_date',e.target.value)}/>{fieldErrors.acquired_date&&<div style={{color:'var(--red)',fontSize:12,marginTop:4}}>{fieldErrors.acquired_date}</div>}</Field>
-            {/* #2 In-service date is depreciation start */}
-            <Field label="In Service Date (Depreciation Start)" required><input type="date" value={form.in_service_date} onChange={e=>set('in_service_date',e.target.value)}/>{fieldErrors.in_service_date&&<div style={{color:'var(--red)',fontSize:12,marginTop:4}}>{fieldErrors.in_service_date}</div>}</Field>
-          </div>
-        </>}
-        {step===2&&<>
-          <Alert type="info" style={{marginBottom:14}}>Depreciation starts from the In Service date using straight-line method and is calculated automatically when the asset is saved.</Alert>
-          <div className="form-row">
-            <Field label="Purchase Value (£)" required><input type="number" min="0" step="0.01" value={form.purchase_value} onChange={e=>set('purchase_value',e.target.value)}/>{fieldErrors.purchase_value&&<div style={{color:'var(--red)',fontSize:12,marginTop:4}}>{fieldErrors.purchase_value}</div>}</Field>
-            <Field label="Purchase Date" required><input type="date" value={form.purchase_date} onChange={e=>set('purchase_date',e.target.value)}/></Field>
-          </div>
-          <div className="form-row">
-            <Field label="Salvage Value (£)" required><input type="number" min="0" step="0.01" value={form.salvage_value} onChange={e=>set('salvage_value',e.target.value)}/>{fieldErrors.salvage_value&&<div style={{color:'var(--red)',fontSize:12,marginTop:4}}>{fieldErrors.salvage_value}</div>}</Field>
-            {/* #1 useful_life_months not years */}
-            <Field label="Useful Life (months)" required><input type="number" min="1" step="1" value={form.useful_life_months} onChange={e=>set('useful_life_months',e.target.value)} placeholder="e.g. 60 for 5 years"/>{fieldErrors.useful_life_months&&<div style={{color:'var(--red)',fontSize:12,marginTop:4}}>{fieldErrors.useful_life_months}</div>}</Field>
-          </div>
-          {estAnnual&&(
-            <div style={{padding:14,background:'var(--surface)',borderRadius:'var(--radius)',border:'1px solid var(--border)',marginBottom:14}}>
-              <div style={{fontSize:12,color:'var(--text-lt)',marginBottom:4}}>Estimated depreciation</div>
-              <div style={{fontWeight:700,fontSize:'1.1rem',color:'var(--navy)'}}>£{estMonthly}/month · £{estAnnual}/year</div>
-            </div>
-          )}
-          <Field label="Warranty Expiration"><input type="date" value={form.warranty_expiration} onChange={e=>set('warranty_expiration',e.target.value)}/></Field>
-        </>}
-        {step===3&&<>
-          <div className="form-row"><Field label="Building"><input value={form.building} onChange={e=>set('building',e.target.value)}/></Field><Field label="Floor"><input value={form.floor} onChange={e=>set('floor',e.target.value)}/></Field></div>
-          <div className="form-row"><Field label="Room"><input value={form.room} onChange={e=>set('room',e.target.value)}/></Field><Field label="Environment"><select value={form.environment} onChange={e=>set('environment',e.target.value)}>{ENVIRONMENTS.map(e=><option key={e}>{e}</option>)}</select></Field></div>
-          <div className="form-row"><Field label="Assigned To"><input value={form.assigned_to} onChange={e=>set('assigned_to',e.target.value)}/></Field><Field label="Assigned Department"><input value={form.assigned_department} onChange={e=>set('assigned_department',e.target.value)}/></Field></div>
-          <Field label="Usage Level"><select value={form.usage_level} onChange={e=>set('usage_level',e.target.value)}>{USAGE_LEVELS.map(u=><option key={u}>{u}</option>)}</select></Field>
-        </>}
-        {step===4&&<>
-          <h3 style={{marginBottom:8}}>Asset Photograph</h3>
-          <p className="text-lt text-sm" style={{marginBottom:16}}>Stored securely in a private S3 bucket. AI analysis available after upload. If upload fails the asset is still saved and you can upload later.</p>
-          {photoError&&<Alert type="info" style={{marginBottom:12}}>{photoError}</Alert>}
-          {photoPreview
-            ?<div><img src={photoPreview} alt="Preview" style={{maxWidth:'100%',maxHeight:280,borderRadius:'var(--radius)',border:'1px solid var(--border)',objectFit:'cover'}}/><button className="btn-secondary btn-sm" style={{marginTop:8}} onClick={()=>{setPhotoFile(null);setPhotoPreview(null);setPhotoError('');}}>Remove</button></div>
-            :<label style={{display:'block',border:'2px dashed var(--border)',borderRadius:'var(--radius-lg)',padding:'40px 20px',textAlign:'center',cursor:'pointer',color:'var(--text-lt)'}}>
-              <div style={{fontSize:32,marginBottom:8}}>📷</div>
-              <div style={{fontWeight:500,marginBottom:4}}>Click to upload photograph</div>
-              <div className="text-sm">JPEG or PNG — optional</div>
-              <input type="file" accept="image/jpeg,image/png" style={{display:'none'}} onChange={handlePhoto}/>
-            </label>
-          }
-        </>}
-        {step===5&&<>
-          <h3 style={{marginBottom:16}}>Review and Confirm</h3>
-          {[
-            {heading:'Asset Details',rows:[['Name',form.name],['Category',form.category],['Manufacturer',form.manufacturer],['Model',form.model],['Serial Number',form.serial_number],['Status',form.status],['Condition',form.condition],['Acquired',form.acquired_date],['In Service (Depreciation Start)',form.in_service_date]]},
-            {heading:'Financial',rows:[['Purchase Value',`£${form.purchase_value}`],['Purchase Date',form.purchase_date],['Salvage Value',`£${form.salvage_value}`],['Useful Life',`${form.useful_life_months} months (${(parseFloat(form.useful_life_months||0)/12).toFixed(1)} years)`],['Est. Monthly Depreciation',estMonthly?`£${estMonthly}`:'—'],['Est. Annual Depreciation',estAnnual?`£${estAnnual}`:'—']]},
-            {heading:'Location',rows:[['Building',form.building||'—'],['Room',form.room||'—'],['Assigned To',form.assigned_to||'—'],['Department',form.assigned_department||'—']]},
-          ].map(section=>(
-            <div key={section.heading} style={{marginBottom:20}}>
-              <h3 style={{fontSize:13,color:'var(--slate)',marginBottom:10}}>{section.heading}</h3>
-              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'6px 24px'}}>
-                {section.rows.map(([label,val])=><div key={label} style={{display:'flex',gap:8,fontSize:13}}><span style={{color:'var(--text-lt)',minWidth:160}}>{label}</span><span style={{fontWeight:500}}>{val}</span></div>)}
+
+        {/* ── STEP 1: Photo and AI ── */}
+        {step===1&&(
+          <div>
+            <h3 style={{marginBottom:8}}>Upload Asset Photo</h3>
+            <p className="text-lt text-sm" style={{marginBottom:20}}>
+              Upload a clear photo of the asset. AI will automatically identify the category, manufacturer, model, condition and description. You can review and correct any suggestions before saving.
+            </p>
+
+            {photoPreview ? (
+              <div style={{marginBottom:20}}>
+                <img src={photoPreview} alt="Asset preview" style={{maxWidth:'100%',maxHeight:300,borderRadius:'var(--radius)',border:'1px solid var(--border)',objectFit:'cover',display:'block',marginBottom:12}}/>
+                <div style={{display:'flex',gap:8}}>
+                  <button className="btn-secondary btn-sm" onClick={()=>{setPhotoFile(null);setPhotoPreview(null);setPhotoError('');}}>Remove Photo</button>
+                  <button className="btn-secondary btn-sm" onClick={()=>fileRef.current?.click()}>Change Photo</button>
+                </div>
+              </div>
+            ) : (
+              <label style={{display:'block',border:'2px dashed var(--border)',borderRadius:'var(--radius-lg)',padding:'48px 20px',textAlign:'center',cursor:'pointer',color:'var(--text-lt)',marginBottom:20}}>
+                <div style={{fontSize:40,marginBottom:12}}>📷</div>
+                <div style={{fontWeight:600,marginBottom:4,fontSize:15}}>Click to upload asset photograph</div>
+                <div className="text-sm">JPEG or PNG — recommended for AI identification</div>
+                <input ref={fileRef} type="file" accept="image/jpeg,image/png" style={{display:'none'}} onChange={handlePhotoSelect}/>
+              </label>
+            )}
+
+            {photoError && <Alert type="info" style={{marginBottom:12}}>{photoError}</Alert>}
+
+            <div style={{display:'flex',gap:10,justifyContent:'space-between',marginTop:8,paddingTop:16,borderTop:'1px solid var(--border)'}}>
+              <button className="btn-secondary" onClick={()=>navigate('/assets')}>Cancel</button>
+              <div style={{display:'flex',gap:10}}>
+                <button className="btn-secondary" onClick={skipPhoto}>Skip — Enter Manually</button>
+                <button className="btn-primary" onClick={handleAnalyze} disabled={analyzing}>
+                  {analyzing ? '🔄 Analysing photo…' : photoFile ? '🔍 Analyse Photo & Continue' : 'Continue Without Photo'}
+                </button>
               </div>
             </div>
-          ))}
-          {photoPreview&&<img src={photoPreview} alt="Asset" style={{maxWidth:200,borderRadius:'var(--radius)',border:'1px solid var(--border)'}}/>}
-          <Alert type="info" style={{marginTop:16}}>Depreciation will be calculated automatically from the In Service date when this record is saved.</Alert>
-        </>}
-        <div style={{display:'flex',justifyContent:'space-between',marginTop:20,paddingTop:16,borderTop:'1px solid var(--border)'}}>
-          <button className="btn-secondary" onClick={()=>step>1?setStep(s=>s-1):navigate('/assets')} disabled={saving}>{step===1?'Cancel':'Back'}</button>
-          {step<5?<button className="btn-primary" onClick={()=>{setFieldErrors({});setStep(s=>s+1);}}>Continue</button>
-                 :<button className="btn-primary" onClick={handleSubmit} disabled={saving}>{saving?'Saving…':'Save Asset'}</button>}
-        </div>
+          </div>
+        )}
+
+        {/* ── STEP 2: Details (pre-filled by AI) ── */}
+        {step===2&&(
+          <div>
+            {aiStatus==='success'&&(
+              <Alert type="info" style={{marginBottom:16}}>
+                ✅ AI identified this asset. Fields have been pre-filled from the photo analysis. Review and correct any information before continuing.
+              </Alert>
+            )}
+            {aiStatus==='manual'&&(
+              <Alert type="info" style={{marginBottom:16}}>
+                AI could not identify this asset from the photograph. Please enter the asset details manually.
+              </Alert>
+            )}
+            {aiStatus==='skipped'&&(
+              <Alert type="info" style={{marginBottom:16}}>
+                No photo uploaded. Enter all asset details manually.
+              </Alert>
+            )}
+
+            <div className="form-row">
+              <Field label="Asset Name" required error={fieldErrors.name}><input value={form.name} onChange={e=>set('name',e.target.value)} placeholder="e.g. Dell Latitude 5540"/></Field>
+              <Field label="Category"><select value={form.category} onChange={e=>set('category',e.target.value)}>{CATEGORIES.map(c=><option key={c}>{c}</option>)}</select></Field>
+            </div>
+            <div className="form-row">
+              <Field label="Manufacturer"><input value={form.manufacturer} onChange={e=>set('manufacturer',e.target.value)}/></Field>
+              <Field label="Model"><input value={form.model} onChange={e=>set('model',e.target.value)}/></Field>
+            </div>
+            <div className="form-row">
+              <Field label="Serial Number"><input value={form.serial_number} onChange={e=>set('serial_number',e.target.value)}/></Field>
+              <Field label="Asset Tag"><input value={form.asset_tag} onChange={e=>set('asset_tag',e.target.value)}/></Field>
+            </div>
+            <Field label="Description"><textarea value={form.description} onChange={e=>set('description',e.target.value)} rows={3} placeholder="Describe the asset"/></Field>
+            <div className="form-row">
+              <Field label="Status"><select value={form.status} onChange={e=>set('status',e.target.value)}>{STATUSES.map(s=><option key={s}>{s}</option>)}</select></Field>
+              <Field label="Condition"><select value={form.condition} onChange={e=>set('condition',e.target.value)}>{CONDITIONS.map(c=><option key={c}>{c}</option>)}</select></Field>
+            </div>
+            <div className="form-row">
+              <Field label="Acquisition Date" required error={fieldErrors.acquired_date}><input type="date" value={form.acquired_date} onChange={e=>set('acquired_date',e.target.value)}/></Field>
+              <Field label="In Service Date (Depreciation Start)" required error={fieldErrors.in_service_date}><input type="date" value={form.in_service_date} onChange={e=>set('in_service_date',e.target.value)}/></Field>
+            </div>
+          </div>
+        )}
+
+        {/* ── STEP 3: Financial ── */}
+        {step===3&&(
+          <div>
+            <Alert type="info" style={{marginBottom:14}}>Depreciation starts from the In Service date using straight-line method and is calculated automatically.</Alert>
+            <div className="form-row">
+              <Field label="Purchase Value ($)" required error={fieldErrors.purchase_value}><input type="number" min="0" step="0.01" value={form.purchase_value} onChange={e=>set('purchase_value',e.target.value)}/></Field>
+              <Field label="Purchase Date" required error={fieldErrors.purchase_date}><input type="date" value={form.purchase_date} onChange={e=>set('purchase_date',e.target.value)}/></Field>
+            </div>
+            <div className="form-row">
+              <Field label="Salvage Value ($)" required error={fieldErrors.salvage_value}><input type="number" min="0" step="0.01" value={form.salvage_value} onChange={e=>set('salvage_value',e.target.value)}/></Field>
+              <Field label="Useful Life (months)" required error={fieldErrors.useful_life_months}><input type="number" min="1" step="1" value={form.useful_life_months} onChange={e=>set('useful_life_months',e.target.value)} placeholder="e.g. 60 for 5 years"/></Field>
+            </div>
+            {estAnnual&&(
+              <div style={{padding:14,background:'var(--surface)',borderRadius:'var(--radius)',border:'1px solid var(--border)',marginBottom:14}}>
+                <div style={{fontSize:12,color:'var(--text-lt)',marginBottom:4}}>Estimated depreciation</div>
+                <div style={{fontWeight:700,fontSize:'1.1rem',color:'var(--navy)'}}>${estMonthly}/month · ${estAnnual}/year</div>
+              </div>
+            )}
+            <Field label="Warranty Expiration"><input type="date" value={form.warranty_expiration} onChange={e=>set('warranty_expiration',e.target.value)}/></Field>
+          </div>
+        )}
+
+        {/* ── STEP 4: Location ── */}
+        {step===4&&(
+          <div>
+            <div className="form-row">
+              <Field label="Building"><input value={form.building} onChange={e=>set('building',e.target.value)}/></Field>
+              <Field label="Floor"><input value={form.floor} onChange={e=>set('floor',e.target.value)}/></Field>
+            </div>
+            <div className="form-row">
+              <Field label="Room"><input value={form.room} onChange={e=>set('room',e.target.value)}/></Field>
+              <Field label="Environment"><select value={form.environment} onChange={e=>set('environment',e.target.value)}>{ENVIRONMENTS.map(e=><option key={e}>{e}</option>)}</select></Field>
+            </div>
+            <div className="form-row">
+              <Field label="Assigned To"><input value={form.assigned_to} onChange={e=>set('assigned_to',e.target.value)}/></Field>
+              <Field label="Assigned Department"><input value={form.assigned_department} onChange={e=>set('assigned_department',e.target.value)}/></Field>
+            </div>
+            <Field label="Usage Level"><select value={form.usage_level} onChange={e=>set('usage_level',e.target.value)}>{USAGE_LEVELS.map(u=><option key={u}>{u}</option>)}</select></Field>
+          </div>
+        )}
+
+        {/* ── STEP 5: Confirm ── */}
+        {step===5&&(
+          <div>
+            <h3 style={{marginBottom:16}}>Review and Confirm</h3>
+            {photoPreview&&(
+              <div style={{marginBottom:20}}>
+                <div className="text-sm text-lt" style={{marginBottom:8}}>Asset Photo</div>
+                <img src={photoPreview} alt="Asset" style={{maxWidth:240,borderRadius:'var(--radius)',border:'1px solid var(--border)'}}/>
+              </div>
+            )}
+            {[
+              {heading:'Asset Details', rows:[['Name',form.name],['Category',form.category],['Manufacturer',form.manufacturer||'—'],['Model',form.model||'—'],['Serial Number',form.serial_number||'—'],['Status',form.status],['Condition',form.condition],['Acquired',form.acquired_date],['In Service (Depreciation Start)',form.in_service_date]]},
+              {heading:'Financial', rows:[['Purchase Value',`$${form.purchase_value}`],['Purchase Date',form.purchase_date],['Salvage Value',`$${form.salvage_value}`],['Useful Life',`${form.useful_life_months} months (${(parseInt(form.useful_life_months||0)/12).toFixed(1)} yrs)`],['Est. Monthly Depreciation',estMonthly?`$${estMonthly}`:'—'],['Est. Annual Depreciation',estAnnual?`$${estAnnual}`:'—']]},
+              {heading:'Location', rows:[['Building',form.building||'—'],['Room',form.room||'—'],['Assigned To',form.assigned_to||'—'],['Department',form.assigned_department||'—']]},
+            ].map(section=>(
+              <div key={section.heading} style={{marginBottom:20}}>
+                <h3 style={{fontSize:13,color:'var(--slate)',marginBottom:10}}>{section.heading}</h3>
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'6px 24px'}}>
+                  {section.rows.map(([label,val])=><div key={label} style={{display:'flex',gap:8,fontSize:13}}><span style={{color:'var(--text-lt)',minWidth:160}}>{label}</span><span style={{fontWeight:500}}>{val}</span></div>)}
+                </div>
+              </div>
+            ))}
+            <Alert type="info" style={{marginTop:16}}>Depreciation will be calculated automatically from the In Service date when this record is saved.</Alert>
+          </div>
+        )}
+
+        {/* Navigation buttons */}
+        {step>1&&(
+          <div style={{display:'flex',justifyContent:'space-between',marginTop:20,paddingTop:16,borderTop:'1px solid var(--border)'}}>
+            <button className="btn-secondary" onClick={()=>setStep(s=>s-1)} disabled={saving}>Back</button>
+            {step<5
+              ? <button className="btn-primary" onClick={()=>{setFieldErrors({});setStep(s=>s+1);}}>Continue</button>
+              : <button className="btn-primary" onClick={handleSubmit} disabled={saving}>{saving?'Saving…':'Save Asset'}</button>
+            }
+          </div>
+        )}
       </div>
     </div>
   );
@@ -726,8 +915,7 @@ function EditAsset() {
       name:p.name||'',description:p.description||'',category:p.category||'IT Equipment',
       manufacturer:p.manufacturer||'',model:p.model||'',serial_number:p.serial_number||'',asset_tag:p.asset_tag||'',
       purchase_value:f.purchase_value||'',salvage_value:f.salvage_value||'',
-      // #1 prefer months, fall back to years*12
-      useful_life_months: f.useful_life_months||(f.useful_life_years?Math.round(f.useful_life_years*12):''),
+      useful_life_months:f.useful_life_months||(f.useful_life_years?Math.round(f.useful_life_years*12):''),
       warranty_expiration:ns(f.warranty_expiration),total_repair_cost:f.total_repair_cost||0,number_of_repairs:f.number_of_repairs||0,
       status:s.status||'Available',usage_level:s.usage_level||'Daily',environment:s.environment||'Indoor',
       checked_out_to:ns(s.checked_out_to),expected_return_date:ns(s.expected_return_date),
@@ -740,12 +928,10 @@ function EditAsset() {
     const aiRaw=sessionStorage.getItem('aiSuggestions');
     if(aiRaw){
       const ai=JSON.parse(aiRaw); sessionStorage.removeItem('aiSuggestions'); setAiPrepopulated(true);
-      // #3 Map updated AI schema fields
       setForm({...baseForm,
         ...(ai.category&&{category:ai.category}),
         ...(ai.condition&&{condition:ai.condition}),
         ...(ai.description&&{description:ai.description}),
-        // #1 useful_life_months from AI
         ...(ai.useful_life_months&&{useful_life_months:ai.useful_life_months}),
       });
     } else { setForm(baseForm); }
@@ -776,7 +962,7 @@ function EditAsset() {
         <h1>Edit Asset — <span className="mono" style={{fontSize:'1rem',color:'var(--text-lt)'}}>{id}</span></h1>
       </div>
       {error&&<Alert>{error}</Alert>}
-      {aiRejected&&<Alert type="info" style={{marginBottom:16}}>AI could not identify this asset from the photograph. Please enter the asset details manually.</Alert>}
+      {aiRejected&&<Alert type="info" style={{marginBottom:16}}>AI could not identify this asset. Please enter the asset details manually.</Alert>}
       {aiPrepopulated&&<Alert type="info" style={{marginBottom:16}}>Form pre-populated with AI suggestions. Review and adjust before saving.</Alert>}
       <Tabs tabs={['profile','financial','status','location']} active={tab} onChange={setTab}/>
       <div className="card">
@@ -789,17 +975,16 @@ function EditAsset() {
         {tab==='financial'&&<>
           <Alert type="info" style={{marginBottom:16}}>Updating financial fields recalculates depreciation automatically from the In Service date.</Alert>
           <div className="form-row">
-            <Field label="Purchase Value (£)"><input type="number" value={form.purchase_value} onChange={e=>set('purchase_value',e.target.value)}/></Field>
-            <Field label="Salvage Value (£)"><input type="number" value={form.salvage_value} onChange={e=>set('salvage_value',e.target.value)}/></Field>
+            <Field label="Purchase Value ($)"><input type="number" value={form.purchase_value} onChange={e=>set('purchase_value',e.target.value)}/></Field>
+            <Field label="Salvage Value ($)"><input type="number" value={form.salvage_value} onChange={e=>set('salvage_value',e.target.value)}/></Field>
           </div>
           <div className="form-row">
-            {/* #1 Useful life in months */}
             <Field label="Useful Life (months)"><input type="number" min="1" step="1" value={form.useful_life_months} onChange={e=>set('useful_life_months',e.target.value)} placeholder="e.g. 60 for 5 years"/></Field>
             <Field label="Warranty Expiration"><input type="date" value={form.warranty_expiration} onChange={e=>set('warranty_expiration',e.target.value)}/></Field>
           </div>
           <div className="form-row">
             <Field label="Number of Repairs"><input type="number" min="0" value={form.number_of_repairs} onChange={e=>set('number_of_repairs',e.target.value)}/></Field>
-            <Field label="Total Repair Cost (£)"><input type="number" min="0" step="0.01" value={form.total_repair_cost} onChange={e=>set('total_repair_cost',e.target.value)}/></Field>
+            <Field label="Total Repair Cost ($)"><input type="number" min="0" step="0.01" value={form.total_repair_cost} onChange={e=>set('total_repair_cost',e.target.value)}/></Field>
           </div>
         </>}
         {tab==='status'&&<>
@@ -833,30 +1018,18 @@ function LogMaintenance() {
   const {id}=useParams(); const navigate=useNavigate();
   const [saving,setSaving]=useState(false); const [error,setError]=useState('');
   const [fieldErrors,setFieldErrors]=useState({});
-  const [form,setForm]=useState({
-    maintenance_type:'Scheduled',performed_date:new Date().toISOString().slice(0,10),
-    cost:'',next_due_date:'',condition_after_service:'',notes:''
-  });
+  const [form,setForm]=useState({maintenance_type:'Scheduled',performed_date:new Date().toISOString().slice(0,10),cost:'',next_due_date:'',condition_after_service:'',notes:''});
   const set=(k,v)=>setForm(p=>({...p,[k]:v}));
-
   async function save(){
     const errs={};
     if(!form.maintenance_type) errs.maintenance_type='Maintenance type is required';
     if(!form.performed_date)   errs.performed_date='Performed date is required';
     if(Object.keys(errs).length){setFieldErrors(errs);return;}
     setSaving(true);setError('');setFieldErrors({});
-    try{
-      await api.addMaintenance(id,{
-        ...form,
-        cost: parseFloat(form.cost)||0,
-        // #4 performed_by is set by Lambda from authenticated identity
-        // #5 condition_after_service included
-      });
-      navigate(`/assets/${id}`);
-    }catch(e){setError(e.message);}
+    try{await api.addMaintenance(id,{...form,cost:parseFloat(form.cost)||0});navigate(`/assets/${id}`);}
+    catch(e){setError(e.message);}
     finally{setSaving(false);}
   }
-
   return (
     <div style={{maxWidth:580}}>
       <div style={{display:'flex',gap:12,alignItems:'center',marginBottom:24}}>
@@ -866,22 +1039,13 @@ function LogMaintenance() {
       {error&&<Alert>{error}</Alert>}
       <div className="card">
         <div className="form-row">
-          <Field label="Maintenance Type" required>
-            <select value={form.maintenance_type} onChange={e=>set('maintenance_type',e.target.value)}>
-              {MAINT_TYPES.map(t=><option key={t}>{t}</option>)}
-            </select>
-            {fieldErrors.maintenance_type&&<div style={{color:'var(--red)',fontSize:12,marginTop:4}}>{fieldErrors.maintenance_type}</div>}
-          </Field>
-          <Field label="Performed Date" required>
-            <input type="date" value={form.performed_date} onChange={e=>set('performed_date',e.target.value)}/>
-            {fieldErrors.performed_date&&<div style={{color:'var(--red)',fontSize:12,marginTop:4}}>{fieldErrors.performed_date}</div>}
-          </Field>
+          <Field label="Maintenance Type" required error={fieldErrors.maintenance_type}><select value={form.maintenance_type} onChange={e=>set('maintenance_type',e.target.value)}>{MAINT_TYPES.map(t=><option key={t}>{t}</option>)}</select></Field>
+          <Field label="Performed Date" required error={fieldErrors.performed_date}><input type="date" value={form.performed_date} onChange={e=>set('performed_date',e.target.value)}/></Field>
         </div>
         <div className="form-row">
-          <Field label="Cost (£)"><input type="number" min="0" step="0.01" value={form.cost} onChange={e=>set('cost',e.target.value)} placeholder="0.00"/></Field>
+          <Field label="Cost ($)"><input type="number" min="0" step="0.01" value={form.cost} onChange={e=>set('cost',e.target.value)} placeholder="0.00"/></Field>
           <Field label="Next Due Date"><input type="date" value={form.next_due_date} onChange={e=>set('next_due_date',e.target.value)}/></Field>
         </div>
-        {/* #5 Condition after service */}
         <Field label="Condition After Service">
           <select value={form.condition_after_service} onChange={e=>set('condition_after_service',e.target.value)}>
             <option value="">— Not specified —</option>
