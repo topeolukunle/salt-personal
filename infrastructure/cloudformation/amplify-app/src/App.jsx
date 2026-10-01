@@ -683,19 +683,31 @@ function RegisterAsset() {
         useful_life_months: parseInt(form.useful_life_months),
       };
 
-      let finalId = tempAssetId;
+      // Always create a full asset with all records using createAsset
+      // createAsset creates PROFILE, FINANCIALS, STATUS and LOCATION records correctly
+      const result  = await api.createAsset(payload);
+      const finalId = result.asset_id;
 
+      // If a photo was uploaded to the temp asset — move the image_key to the real asset
       if (tempAssetId) {
-        // Update the temporary asset created during photo upload
-        await api.updateAsset(tempAssetId, {...payload, record_type: 'PROFILE'});
-        if (payload.purchase_value) {
-          await api.updateAsset(tempAssetId, {...payload, record_type: 'FINANCIALS'});
+        try {
+          // Get the image_key from the temp asset
+          const tempRecords = await api.getAsset(tempAssetId);
+          const tempProfile = (Array.isArray(tempRecords) ? tempRecords : [])
+            .find(r => r.record_type === 'PROFILE');
+          const imageKey = tempProfile?.image_key;
+
+          if (imageKey) {
+            // Copy image_key to the real asset
+            await api.updateAsset(finalId, { image_key: imageKey, record_type: 'PROFILE' });
+          }
+
+          // Delete the temporary asset
+          await api.deleteAsset(tempAssetId);
+        } catch(photoErr) {
+          // Photo transfer failed but asset was created — not critical
+          console.warn('Photo transfer failed:', photoErr.message);
         }
-        await api.updateAsset(tempAssetId, {...payload, record_type: 'STATUS'});
-      } else {
-        // No photo — create fresh
-        const result = await api.createAsset(payload);
-        finalId = result.asset_id;
       }
 
       navigate(`/assets/${finalId}`);
